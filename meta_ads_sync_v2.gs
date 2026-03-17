@@ -51,12 +51,12 @@ const CONFIG = {
   TABS: {
     DASHBOARD:        '📊 dashboard',
     META_DEEP:        '📈 meta_deep_dives',
-    GOOGLE_DEEP:      '📈 google_deep_dives',
+    GOOGLE_DEEP:      '📈 google_deep_dives', // Optional: leave blank or remove if not using Google Ads
     META_CREATIVE:    'meta_creative',
     META_AGE:         'meta_age_gender',
     META_DAILY:       'meta_daily',
     META_ADSET:       'meta_adset_daily',
-    GOOGLE_ADS:       'google_ads_daily',
+    GOOGLE_ADS:       'google_ads_daily',     // Optional: leave blank or remove if not using Google Ads
     LOG:              'sync_log'
   }
 };
@@ -309,7 +309,7 @@ function buildDashboard(log) {
   let gAdsP7 = { spend: 0, revenue: 0, purchases: 0, impressions: 0, clicks: 0, roas: 0, cpa: 0, cpc: 0, cpm: 0, ctr: 0, cvr: 0 };
   let gAdsAll = { spend: 0, revenue: 0, purchases: 0, impressions: 0, clicks: 0, roas: 0, cpa: 0, cpc: 0, cpm: 0, ctr: 0, cvr: 0 };
 
-  const gAdsSheet = ss.getSheetByName(CONFIG.TABS.GOOGLE_ADS);
+  const gAdsSheet = CONFIG.TABS.GOOGLE_ADS ? ss.getSheetByName(CONFIG.TABS.GOOGLE_ADS) : null;
   if (gAdsSheet && gAdsSheet.getLastRow() > 1) {
     hasGoogleAds = true;
     const gdata = gAdsSheet.getRange(2, 1, gAdsSheet.getLastRow() - 1, gAdsSheet.getLastColumn()).getValues();
@@ -775,7 +775,7 @@ function buildDashboard(log) {
   // ── Cross-channel: Google Ads campaign health ────────────────────────
   if (hasGoogleAds && gAdsL7.spend > 0) {
     // Check for wasteful Google campaigns
-    const gAdsSheet3 = ss.getSheetByName(CONFIG.TABS.GOOGLE_ADS);
+    const gAdsSheet3 = CONFIG.TABS.GOOGLE_ADS ? ss.getSheetByName(CONFIG.TABS.GOOGLE_ADS) : null;
     if (gAdsSheet3 && gAdsSheet3.getLastRow() > 1) {
       const gh3 = gAdsSheet3.getRange(1, 1, 1, gAdsSheet3.getLastColumn()).getValues()[0];
       const gd3 = gAdsSheet3.getRange(2, 1, gAdsSheet3.getLastRow() - 1, gAdsSheet3.getLastColumn()).getValues();
@@ -1187,7 +1187,7 @@ function buildDashboard(log) {
 
   // Include Google Ads campaigns if data exists
   if (hasGoogleAds) {
-    const gAdsSheet2 = ss.getSheetByName(CONFIG.TABS.GOOGLE_ADS);
+    const gAdsSheet2 = CONFIG.TABS.GOOGLE_ADS ? ss.getSheetByName(CONFIG.TABS.GOOGLE_ADS) : null;
     if (gAdsSheet2 && gAdsSheet2.getLastRow() > 1) {
       const gh = gAdsSheet2.getRange(1, 1, 1, gAdsSheet2.getLastColumn()).getValues()[0];
       const gd = gAdsSheet2.getRange(2, 1, gAdsSheet2.getLastRow() - 1, gAdsSheet2.getLastColumn()).getValues();
@@ -1646,7 +1646,7 @@ function buildDashboard(log) {
   // ══════════════════════════════════════════════════════════════════════
   // 📈 GOOGLE DEEP DIVES TAB — PMax Asset Groups, Products, Search Terms
   // ══════════════════════════════════════════════════════════════════════
-  if (hasGoogleAds) {
+  if (hasGoogleAds && CONFIG.TABS.GOOGLE_DEEP) {
     let gSheet = ss.getSheetByName(CONFIG.TABS.GOOGLE_DEEP);
     if (!gSheet) gSheet = ss.insertSheet(CONFIG.TABS.GOOGLE_DEEP);
     gSheet.clear();
@@ -2014,7 +2014,7 @@ function buildDashboard(log) {
     CONFIG.TABS.GOOGLE_DEEP,
     CONFIG.TABS.META_CREATIVE,
     CONFIG.TABS.META_AGE,
-  ];
+  ].filter(Boolean);
 
   tabOrder.forEach((tabName, idx) => {
     const tab = ss.getSheetByName(tabName);
@@ -2028,7 +2028,7 @@ function buildDashboard(log) {
   const dashTab = ss.getSheetByName(CONFIG.TABS.DASHBOARD);
   if (dashTab) ss.setActiveSheet(dashTab);
 
-  log.push('dashboard + meta_deep_dives + google_deep_dives: built');
+  log.push(`dashboard + meta_deep_dives${hasGoogleAds ? ' + google_deep_dives' : ''}: built`);
 }
 
 
