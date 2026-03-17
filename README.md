@@ -2,15 +2,30 @@
 
 This repository contains two scripts designed to synchronize advertising data from **Meta Ads** and **Google Ads** directly into **Google Sheets**. Together, they form an automated performance dashboard to track KPIs, find creative fatigue, and highlight actionable insights.
 
+![Overview](assets/dashboard_overview.png)
+*Automated Dashboard with AI Insights*
+
+![Campaigns](assets/campaigns_wow.png)
+*WoW Campaign Performance Tracking*
+
 ---
 
 ## 1. Meta Ads Sync + Decision Engine (`meta_ads_sync_v2.gs`)
 This script pulls data from Meta's API into Google Sheets. It includes a built-in decision engine that generates action items, creative scoring, and fatigue detection.
 
+![Creative Scoring](assets/meta_creative_scoring.png)
+*Creative Scoring and Fatigue Detection Tab*
+
 ### Features
 - **Dashboard Construction**: Aggregates top-level numbers and flags issues (e.g., Roas dropped, CPC spikes).
 - **Creative & Ad Set Deep Dives**: Tracks performance per ad set and tracks creative engagement metrics (Thumbstop, Hold Rate).
 - **AI Integration**: Optionally plug in a Claude or Gemini API key for advanced AI insights on your ad performance.
+
+![Meta KPIs](assets/meta_deep_dives_kpi.png)
+*Detailed Meta Metric Analysis*
+
+![Meta Funnel](assets/meta_deep_dives_funnel.png)
+*Visualized Meta Shopping Funnel*
 
 ### Setup Instructions
 1. Create a **New Google Sheet**.
@@ -32,6 +47,9 @@ This script executes inside Google Ads and pushes 4 specialized data sets to the
 - `google_ads_assets` — Asset group performance (PMax breakdowns)
 - `google_ads_products` — Shopping product performance (what is actually selling)
 - `google_ads_search` — Search term insights (queries triggering your PMax ads)
+
+![Google Ads Deep Dives](assets/google_deep_dives.png)
+*Cross-channel Google Ads and PMax Insights*
 
 ### Setup Instructions
 1. Open your **Google Ads Account**.
