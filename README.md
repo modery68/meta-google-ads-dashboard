@@ -41,7 +41,9 @@ This script pulls data from Meta's API into Google Sheets. It includes a built-i
 
 ---
 
-## 2. Google Ads Sync - PMax Enhanced (`google_ads_sync.js`)
+## 2. Google Ads Sync - PMax Enhanced (`google_ads_sync.js`) (Optional)
+**Note:** A Google Ads account is entirely optional. If you only run Meta Ads, you can skip this section entirely. The Meta Ads sync script will still function perfectly without Google Ads data!
+
 This script executes inside Google Ads and pushes 4 specialized data sets to the *same* Google Sheet:
 - `google_ads_daily` — Campaign-level daily performance
 - `google_ads_assets` — Asset group performance (PMax breakdowns)
