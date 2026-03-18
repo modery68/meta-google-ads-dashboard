@@ -200,23 +200,24 @@ function syncProducts(ss, dateFrom, dateTo) {
 }
 
 // =============================================================================
-// 4. SEARCH TERMS — what people actually searched to see your PMax ads
+// 4. SEARCH TERMS — standard Search/Shopping + PMax search insights combined
 // =============================================================================
 function syncSearchTerms(ss, dateFrom, dateTo) {
   var sheet = getOrCreateSheet(ss, 'google_ads_search');
 
   var headers = [
-    'date', 'campaign', 'search_term',
+    'date', 'campaign', 'search_term', 'source',
     'spend', 'impressions', 'clicks', 'conversions', 'conversion_value',
     'ctr', 'cpc', 'roas'
   ];
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#f3f3f3');
 
-  // Note: Google limits PMax search term visibility.
-  // You'll only see terms that meet Google's privacy thresholds.
-  // Still useful for finding brand vs non-brand split and top converting queries.
-  var query = 'SELECT ' +
+  var rows = [];
+
+  // ── Part A: Standard Search & Shopping campaigns ──────────────────────────
+  // Note: PMax campaigns do NOT appear here — they use a separate API (Part B).
+  var searchQuery = 'SELECT ' +
     'segments.date, campaign.name, search_term_view.search_term, ' +
     'metrics.cost_micros, metrics.impressions, metrics.clicks, ' +
     'metrics.conversions, metrics.conversions_value, ' +
@@ -226,16 +227,15 @@ function syncSearchTerms(ss, dateFrom, dateTo) {
     'AND metrics.impressions > 0 ' +
     'ORDER BY metrics.cost_micros DESC';
 
-  var rows = [];
   try {
-    var iter = AdsApp.report(query).rows();
+    var iter = AdsApp.report(searchQuery).rows();
     while (iter.hasNext()) {
       var r = iter.next();
       var spend = r['metrics.cost_micros'] / 1e6;
       var convVal = parseFloat(r['metrics.conversions_value']) || 0;
       rows.push([
         r['segments.date'], r['campaign.name'],
-        r['search_term_view.search_term'] || '',
+        r['search_term_view.search_term'] || '', 'Search/Shopping',
         spend, parseInt(r['metrics.impressions']) || 0, parseInt(r['metrics.clicks']) || 0,
         parseFloat(r['metrics.conversions']) || 0, convVal,
         (parseFloat(r['metrics.ctr']) || 0) * 100,
@@ -243,15 +243,50 @@ function syncSearchTerms(ss, dateFrom, dateTo) {
         spend > 0 ? convVal / spend : 0
       ]);
     }
+    Logger.log('Search/Shopping terms: ' + rows.length + ' rows');
   } catch (e) {
     Logger.log('Search term query failed: ' + e.message);
   }
 
+  // ── Part B: PMax search term insights ─────────────────────────────────────
+  // PMax doesn't use search_term_view. Use pmax_search_term_insight instead.
+  // Note: Google only reveals terms that meet their privacy threshold (~100+ impressions).
+  var pmaxQuery = 'SELECT ' +
+    'campaign.name, ' +
+    'pmax_search_term_insight.search_term_insight_category, ' +  // category/theme
+    'pmax_search_term_insight.search_term, ' +
+    'metrics.impressions ' +
+    'FROM pmax_search_term_insight ' +
+    'WHERE segments.date BETWEEN "' + dateFrom + '" AND "' + dateTo + '" ' +
+    'ORDER BY metrics.impressions DESC';
+
+  try {
+    var pmaxIter = AdsApp.report(pmaxQuery).rows();
+    var pmaxCount = 0;
+    while (pmaxIter.hasNext()) {
+      var pr = pmaxIter.next();
+      var term = pr['pmax_search_term_insight.search_term'] || '';
+      var category = pr['pmax_search_term_insight.search_term_insight_category'] || '';
+      var label = term ? term : ('[Category: ' + category + ']');
+      rows.push([
+        dateTo, pr['campaign.name'],
+        label, 'PMax',
+        '', // PMax doesn't expose spend per search term
+        parseInt(pr['metrics.impressions']) || 0,
+        '', '', '', '', '', ''
+      ]);
+      pmaxCount++;
+    }
+    Logger.log('PMax search insights: ' + pmaxCount + ' rows');
+  } catch (e) {
+    Logger.log('PMax search insight query failed (may need account-level access): ' + e.message);
+  }
+
   writeRows(sheet, headers, rows, [
-    [4, '"$"#,##0.00'], [5, '#,##0'], [6, '#,##0'], [7, '#,##0.00'],
-    [8, '"$"#,##0.00'], [9, '0.00"%"'], [10, '"$"#,##0.00'], [11, '0.00"x"']
+    [5, '"$"#,##0.00'], [6, '#,##0'], [7, '#,##0'], [8, '#,##0.00'],
+    [9, '"$"#,##0.00'], [10, '0.00"%"'], [11, '"$"#,##0.00'], [12, '0.00"x"']
   ]);
-  Logger.log('Search terms: ' + rows.length + ' rows');
+  Logger.log('Search terms total: ' + rows.length + ' rows');
 }
 
 // =============================================================================
