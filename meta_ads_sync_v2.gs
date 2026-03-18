@@ -36,6 +36,7 @@ const CONFIG = {
     HOLDRATE_FLOOR: 20,             // Below this hold% = losing people mid-video
     TOP_N_CREATIVES: 10,            // How many to show in dashboard "Top" lists
     BUDGET_SHIFT_THRESHOLD: 0.3,    // Flag campaigns spending >30% with ROAS < target
+    MONTHLY_BUDGET: 0,              // Your monthly ad budget ($). 0 = disable pacing tracker.
   },
 
   // ── AI Insight (optional) ───────────────────────────────────────────
@@ -64,7 +65,8 @@ const CONFIG = {
 // Data cache — lets the diagnostic engine access parsed data
 const DATA_CACHE = {
   ageGender: [],
-  creatives: []
+  creatives: [],
+  avgCreativeLifespan: null  // Average days before creative ROAS drops below target
 };
 
 // =============================================================================
@@ -201,6 +203,29 @@ function buildDashboard(log) {
   const last7 = aggregate(last7Rows);
   const prior7 = aggregate(prior7Rows);
 
+  // ── ROLLING BASELINE (4-week average, excluding last 7 days) ────────
+  const baselineDates = completedDates.slice(0, -7);
+  const baselineRows = dailyRows.filter(r => baselineDates.includes(r.date));
+  const baselineRaw = aggregate(baselineRows);
+  const baselineDays = baselineDates.length || 1;
+  // Normalize volume metrics to 7-day equivalent; rate metrics use raw aggregate
+  const baselineNorm = {
+    spend: baselineRaw.spend / baselineDays * 7,
+    revenue: baselineRaw.revenue / baselineDays * 7,
+    purchases: baselineRaw.purchases / baselineDays * 7,
+    impressions: baselineRaw.impressions / baselineDays * 7,
+    clicks: baselineRaw.clicks / baselineDays * 7,
+    atc: baselineRaw.atc / baselineDays * 7,
+    reach: baselineRaw.reach / baselineDays * 7,
+    roas: baselineRaw.roas,
+    cpa: baselineRaw.cpa,
+    cpc: baselineRaw.cpc,
+    cpm: baselineRaw.cpm,
+    ctr: baselineRaw.ctr,
+    cvr: baselineRaw.cvr,
+    aov: baselineRaw.aov,
+  };
+
   // Actual date range labels (no year — we know what year it is)
   function shortDate(d) {
     const parts = d.split('-');
@@ -294,6 +319,64 @@ function buildDashboard(log) {
   // Frequency is already computed from account-level API calls above (avgFreq7, avgFreqP7)
   // Adset-level frequency from daily rows is used only for per-adset diagnostics below
   const freq7 = adsetRows.filter(r => last7Dates.includes(r.date));
+
+  // ── WEEKLY AGGREGATION (used by diagnostics + charts later) ─────────
+  const weekBuckets = {};
+  sortedDates.forEach(dateStr => {
+    const parts = dateStr.split('-');
+    const dateObj = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+    const day = dateObj.getDay();
+    const mondayOffset = day === 0 ? -6 : 1 - day;
+    const monday = new Date(dateObj);
+    monday.setDate(dateObj.getDate() + mondayOffset);
+    const weekKey = Utilities.formatDate(monday, 'UTC', 'MM/dd');
+    if (!weekBuckets[weekKey]) weekBuckets[weekKey] = [];
+    dailyRows.filter(row2 => row2.date === dateStr).forEach(row2 => weekBuckets[weekKey].push(row2));
+  });
+
+  const weekKeys = Object.keys(weekBuckets).sort();
+  const weekAggs = weekKeys.map(wk => {
+    const a = aggregate(weekBuckets[wk]);
+    const weekDates = Object.keys(dailyTrend).filter(d => {
+      const p = d.split('-');
+      const dObj = new Date(parseInt(p[0]), parseInt(p[1]) - 1, parseInt(p[2]));
+      const dy = dObj.getDay();
+      const mo = dy === 0 ? -6 : 1 - dy;
+      const mon = new Date(dObj);
+      mon.setDate(dObj.getDate() + mo);
+      return Utilities.formatDate(mon, 'UTC', 'MM/dd') === wk;
+    });
+    const weekAdsetRows = adsetRows.filter(ar => weekDates.includes(ar.date));
+    const weekImpr = weekAdsetRows.reduce((s, ar) => s + (ar.impressions || 0), 0);
+    const weekReach = weekAdsetRows.reduce((s, ar) => s + (ar.reach || 0), 0);
+    const avgFreqWk = weekReach > 0 ? weekImpr / weekReach : 0;
+    return { week: 'Wk ' + wk, ...a, frequency: avgFreqWk };
+  });
+
+  // ── FREQUENCY → ROAS CORRELATION (learn account-specific threshold) ─
+  // Instead of fixed 2.5/4.0 thresholds, find where YOUR ROAS actually dips
+  const freqRoasPairs = weekAggs
+    .filter(w => w.frequency > 0 && w.spend > 100)
+    .sort((a, b) => a.frequency - b.frequency);
+
+  let learnedFreqThreshold = T.FREQUENCY_WARNING; // fallback to config
+  let freqTippingSource = 'default';
+
+  if (freqRoasPairs.length >= 3) {
+    // Find the first frequency level where ROAS drops below target
+    const belowTarget = freqRoasPairs.find(p => p.roas < T.TARGET_ROAS);
+    if (belowTarget) {
+      learnedFreqThreshold = belowTarget.frequency;
+      freqTippingSource = 'learned';
+    } else {
+      // All weeks above target — use max observed frequency + buffer as safe zone
+      learnedFreqThreshold = Math.max(...freqRoasPairs.map(p => p.frequency)) + 0.5;
+      freqTippingSource = 'safe';
+    }
+    // Clamp to reasonable range
+    learnedFreqThreshold = Math.max(1.5, Math.min(learnedFreqThreshold, 6.0));
+  }
+  const learnedFreqCritical = Math.min(learnedFreqThreshold * 1.5, 6.0);
 
   // ══════════════════════════════════════════════════════════════════════
   // DIAGNOSTIC ENGINE — trace WHY performance shifted
@@ -583,6 +666,27 @@ function buildDashboard(log) {
       }
     }
 
+    // ── CHECK 6b: Creative Aging Warning ──────────────────────────────
+    if (DATA_CACHE.avgCreativeLifespan && DATA_CACHE.avgCreativeLifespan > 0) {
+      const avgLife = DATA_CACHE.avgCreativeLifespan;
+      const atRisk = DATA_CACHE.creatives.filter(c =>
+        c.phase === 'active' &&
+        c.ageDays >= avgLife * 0.8 &&
+        c.recent.roas >= T.TARGET_ROAS &&
+        c.recent.spend > T.MIN_SPEND_FOR_JUDGMENT
+      );
+      if (atRisk.length > 0) {
+        const names = atRisk.slice(0, 3).map(c => `"${c.name}" (${c.ageDays}d)`).join(', ');
+        findings.push({
+          signal: '⚠️ Creative Aging Warning',
+          severity: 'medium',
+          evidence: `${atRisk.length} active creative(s) approaching your avg burnout window (${avgLife}d): ${names}. ` +
+            `Historically, your creatives lose profitability around this age.`,
+          action: 'Start preparing replacement creatives now. Don\'t wait for ROAS to drop — have fresh creatives ready to rotate in. Check the meta_creative tab for the full lifespan view.'
+        });
+      }
+    }
+
     // ── CHECK 7: High-frequency ad sets ───────────────────────────────
     const highFreqAdsets = [];
     const adsetFreqMap = {};
@@ -595,18 +699,21 @@ function buildDashboard(log) {
     Object.entries(adsetFreqMap).forEach(([name, d]) => {
       // impr/reach at adset level across days is a reasonable proxy
       const freq = d.reachSum > 0 ? d.imprSum / d.reachSum : 0;
-      if (freq >= T.FREQUENCY_CRITICAL && d.spend > 100) {
+      if (freq >= learnedFreqCritical && d.spend > 100) {
         highFreqAdsets.push({ name, freq: freq, spend: d.spend });
       }
     });
     if (highFreqAdsets.length > 0) {
       highFreqAdsets.sort((a, b) => b.freq - a.freq);
       const top3 = highFreqAdsets.slice(0, 3).map(a => `${a.name} (${a.freq.toFixed(1)}x)`).join(', ');
+      const thresholdNote = freqTippingSource === 'learned'
+        ? ` (your account's learned tipping point: ${learnedFreqThreshold.toFixed(1)}x)`
+        : '';
       findings.push({
         signal: '🔴 High Frequency Ad Sets',
         severity: 'high',
-        evidence: `${highFreqAdsets.length} ad set(s) above ${T.FREQUENCY_CRITICAL}x frequency: ${top3}`,
-        action: 'Swap creatives in these ad sets or expand the audience size. Frequency above 4x means most of your audience has seen the ad multiple times.'
+        evidence: `${highFreqAdsets.length} ad set(s) above ${learnedFreqCritical.toFixed(1)}x frequency${thresholdNote}: ${top3}`,
+        action: 'Swap creatives in these ad sets or expand the audience size. Your audience has seen these ads too many times.'
       });
     }
 
@@ -624,25 +731,60 @@ function buildDashboard(log) {
       }
     }
 
-    // ── CHECK 9: New Creative Dilution ────────────────────────────────
+    // ── CHECK 9: Launch-Phase ROAS Drag / New Creative Dilution ──────────
+    // Distinguishes between: (A) fresh creative batch just launched = expected drag,
+    // vs (B) ongoing test budget eating into blended ROAS without context.
     if (DATA_CACHE.creatives && DATA_CACHE.creatives.length > 0) {
       const testingCreatives = DATA_CACHE.creatives.filter(c => c.phase === 'testing');
-      const testingSpend = testingCreatives.reduce((s, c) => s + c.recent.spend, 0);
-      const totalSpend7 = last7.spend;
-      const testPct = totalSpend7 > 0 ? (testingSpend / totalSpend7 * 100) : 0;
-      if (testPct > 15 && testingCreatives.length >= 3) {
-        const avgTestRoas = testingCreatives.length > 0
-          ? testingCreatives.reduce((s, c) => s + c.recent.roas, 0) / testingCreatives.length : 0;
+      const newlyLaunched   = DATA_CACHE.creatives.filter(c => c.isNew && c.recent.spend > 0);
+      const testingSpend    = testingCreatives.reduce((s, c) => s + c.recent.spend, 0);
+      const testPct         = last7.spend > 0 ? (testingSpend / last7.spend * 100) : 0;
+
+      if (newlyLaunched.length > 0 && roasDropped) {
+        // Fresh batch scenario — reframe the drop as expected, not alarming
+        const avgTestRoas = newlyLaunched.length > 0
+          ? newlyLaunched.reduce((s, c) => s + c.recent.roas, 0) / newlyLaunched.length : 0;
+        const newSpend = newlyLaunched.reduce((s, c) => s + c.recent.spend, 0);
+        const newPct   = last7.spend > 0 ? (newSpend / last7.spend * 100) : 0;
+        findings.push({
+          signal: '🧪 Launch-Phase ROAS Drag',
+          severity: 'none',
+          evidence: `${newlyLaunched.length} newly launched creative(s) are absorbing ${newPct.toFixed(0)}% of spend ` +
+            `at ${avgTestRoas.toFixed(2)}x ROAS — dragging blended numbers. ` +
+            `This is expected: Meta spends exploratory budget before the algorithm locks in on the best audience for new creatives.`,
+          action: `Don't react to this week's ROAS drop — it's the cost of launching. ` +
+            `Check back in 3-5 days when the learning phase settles. Kill anything below ` +
+            `${T.KILL_ROAS}x after $${T.MIN_SPEND_FOR_JUDGMENT}+ spend.`
+        });
+      } else if (testPct > 15 && testingCreatives.length >= 3) {
+        // No new launch but ongoing test budget is significant — original dilution warning
+        const avgTestRoas = testingCreatives.reduce((s, c) => s + c.recent.roas, 0) / testingCreatives.length;
         findings.push({
           signal: '🟡 New Creative Dilution',
           severity: 'medium',
-          evidence: `${testingCreatives.length} creatives in testing are eating ${testPct.toFixed(0)}% of spend. ` +
+          evidence: `${testingCreatives.length} creatives in testing eating ${testPct.toFixed(0)}% of spend. ` +
             `Avg test ROAS: ${avgTestRoas.toFixed(2)}x vs account ${last7.roas.toFixed(2)}x. This drags blended numbers.`,
           action: 'Expected cost of testing. Kill underperformers faster (anything below ' +
             `${T.KILL_ROAS}x after $${T.MIN_SPEND_FOR_JUDGMENT}+ spend) to limit the drag.`
         });
       }
     }
+
+    // ── CHECK 9b: Spend Elevated + ROAS Holding = Scale Signal ───────────
+    // If spend went up significantly AND ROAS is holding well, this is a
+    // buying signal — Meta has found efficient delivery at higher volume.
+    if (spendDelta > 15 && last7.roas >= T.TARGET_ROAS && Math.abs(roasDelta) < WOW_NOISE_FLOOR) {
+      findings.push({
+        signal: '🚀 Efficient Scale — Opportunity',
+        severity: 'none',
+        evidence: `Spend up ${spendDelta.toFixed(0)}% while ROAS held at ${last7.roas.toFixed(2)}x ` +
+          `(only ${roasDelta >= 0 ? '+' : ''}${roasDelta.toFixed(1)}% WoW). ` +
+          `Meta is finding volume without sacrificing efficiency — this is rare and worth pressing.`,
+        action: `Consider testing another 20-30% budget increase on your top campaigns. ` +
+          `This window typically lasts 1-2 weeks before efficiency starts to compress.`
+      });
+    }
+
 
     // ── CHECK 10: Click→ATC Drop (landing page / product page issue) ──
     if (atcRateDelta < -10 && Math.abs(atcToPurchDelta) < 5 && Math.abs(ctrDelta) < 5) {
@@ -770,6 +912,58 @@ function buildDashboard(log) {
       evidence: `ROAS moved ${roasDelta >= 0 ? '+' : ''}${roasDelta.toFixed(1)}% WoW — within normal variance.`,
       action: 'No fires. Focus on testing new creatives and scaling winners.'
     });
+  }
+
+  // ── BASELINE ANOMALY CHECKS (catches slow drifts WoW misses) ────────
+  if (baselineDates.length >= 14) {
+    const cpmBaselineDelta = pctChange(last7.cpm, baselineNorm.cpm);
+    const roasBaselineDelta = pctChange(last7.roas, baselineNorm.roas);
+    const cpaBaselineDelta = pctChange(last7.cpa, baselineNorm.cpa);
+    const ctrBaselineDelta = pctChange(last7.ctr, baselineNorm.ctr);
+
+    // CPM creeping up vs baseline (even if WoW looks fine)
+    if (cpmBaselineDelta > 15 && Math.abs(cpmDelta) < 10) {
+      findings.push({
+        signal: '🟡 CPM Trend Above Baseline',
+        severity: 'medium',
+        evidence: `CPM is ${cpmBaselineDelta.toFixed(0)}% above your 4-week baseline ($${baselineNorm.cpm.toFixed(2)} avg → $${last7.cpm.toFixed(2)} this week). ` +
+          `WoW change looks small (${cpmDelta.toFixed(1)}%) because last week was already elevated.`,
+        action: 'This is a sustained cost increase, not just a spike. Expand audiences or improve CTR to offset. Check if competitors entered the auction.'
+      });
+    }
+
+    // ROAS below baseline (slow decline WoW missed)
+    if (roasBaselineDelta < -15 && Math.abs(roasDelta) < 10) {
+      findings.push({
+        signal: '🔴 ROAS Below Baseline',
+        severity: 'high',
+        evidence: `ROAS is ${Math.abs(roasBaselineDelta).toFixed(0)}% below your 4-week baseline (${baselineNorm.roas.toFixed(2)}x avg → ${last7.roas.toFixed(2)}x this week). ` +
+          `WoW looks stable because prior week was also weak — this is a multi-week decline.`,
+        action: 'Don\'t be fooled by flat WoW — performance has been declining over multiple weeks. Review creative tab for systemic fatigue and check funnel metrics.'
+      });
+    }
+
+    // CPA creeping up vs baseline
+    if (cpaBaselineDelta > 20 && Math.abs(cpaDelta) < 10) {
+      findings.push({
+        signal: '🟡 CPA Trend Above Baseline',
+        severity: 'medium',
+        evidence: `CPA is ${cpaBaselineDelta.toFixed(0)}% above your 4-week baseline ($${baselineNorm.cpa.toFixed(2)} avg → $${last7.cpa.toFixed(2)} this week). ` +
+          `Gradual efficiency loss that WoW comparison missed.`,
+        action: 'Sustained CPA increase suggests audience fatigue or funnel degradation. Check frequency, creative freshness, and landing page performance.'
+      });
+    }
+
+    // CTR declining vs baseline
+    if (ctrBaselineDelta < -15 && Math.abs(ctrDelta) < 10) {
+      findings.push({
+        signal: '🟡 CTR Trend Below Baseline',
+        severity: 'medium',
+        evidence: `CTR is ${Math.abs(ctrBaselineDelta).toFixed(0)}% below your 4-week baseline (${baselineNorm.ctr.toFixed(2)}% avg → ${last7.ctr.toFixed(2)}% this week). ` +
+          `Creative engagement has been eroding gradually.`,
+        action: 'Your ads are losing attention over time. Prioritize new creative testing — fresh hooks, new angles, different formats.'
+      });
+    }
   }
 
   // ── Cross-channel: Google Ads campaign health ────────────────────────
@@ -904,6 +1098,50 @@ function buildDashboard(log) {
   sheet.setRowHeight(r, 30);
   r += 1;
 
+  // ── BUDGET PACING TRACKER ─────────────────────────────────────────────
+  if (T.MONTHLY_BUDGET > 0) {
+    const now = new Date();
+    const currentMonth = now.getMonth();
+    const currentYear = now.getFullYear();
+    const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+    const todayDate = now.getDate();
+    const remainingDays = daysInMonth - todayDate;
+
+    // Month-to-date spend (from dailyRows in current calendar month)
+    const mtdRows = dailyRows.filter(row => {
+      const parts = row.date.split('-');
+      return parseInt(parts[0]) === currentYear && parseInt(parts[1]) === (currentMonth + 1);
+    });
+    const mtdSpend = mtdRows.reduce((s, row) => s + row.spend, 0);
+
+    // Project using last 7d daily average
+    const avgDailySpend = last7.spend / 7;
+    const projectedSpend = mtdSpend + (avgDailySpend * remainingDays);
+    const variance = projectedSpend - T.MONTHLY_BUDGET;
+    const variancePct = Math.abs(variance / T.MONTHLY_BUDGET * 100);
+
+    const overUnder = variance >= 0 ? 'over' : 'under';
+    const pacingText = `On pace to spend $${projectedSpend.toFixed(0)} by month end — ` +
+      `$${Math.abs(variance).toFixed(0)} ${overUnder} $${T.MONTHLY_BUDGET.toLocaleString()} budget ` +
+      `(MTD: $${mtdSpend.toFixed(0)} through day ${todayDate}/${daysInMonth})`;
+
+    sheet.getRange(r, 1, 1, 13).merge();
+    sheet.getRange(r, 1).setValue(pacingText);
+    sheet.getRange(r, 1).setFontSize(9).setWrap(true).setVerticalAlignment('middle');
+
+    if (variance <= 0) {
+      sheet.getRange(r, 1).setBackground('#e8f0fe').setFontColor('#1967d2'); // Under budget — blue
+    } else if (variancePct <= 10) {
+      sheet.getRange(r, 1).setBackground('#e6f4ea').setFontColor('#137333'); // Within 10% — green
+    } else if (variancePct <= 20) {
+      sheet.getRange(r, 1).setBackground('#fef7e0').setFontColor('#E37400'); // 10-20% over — yellow
+    } else {
+      sheet.getRange(r, 1).setBackground('#fde8e8').setFontColor('#C5221F'); // >20% over — red
+    }
+    sheet.setRowHeight(r, 25);
+    r += 1;
+  }
+
   // ── COMBINED TOTALS (Meta + Google Ads — only if Google Ads data exists) ──
   if (hasGoogleAds) {
     // Header: channel | L7 Spend | L7 Revenue | L7 Purch | L7 ROAS | L7 CPA | WoW ROAS
@@ -953,7 +1191,7 @@ function buildDashboard(log) {
   r += 1;
 
   const kpiStartRow = r;
-  const kpiHeaders = ['Metric', 'Last 7 Days', 'Prior 7 Days', 'WoW Change', `Full ${CONFIG.LOOKBACK_DAYS}d`];
+  const kpiHeaders = ['Metric', 'Last 7 Days', 'Prior 7 Days', 'WoW Δ', 'Baseline Avg', 'vs Base Δ'];
   sheet.getRange(r, 1, 1, kpiHeaders.length).setValues([kpiHeaders]);
   sheet.getRange(r, 1, 1, kpiHeaders.length)
     .setFontWeight('bold').setBackground('#000000').setFontColor('#FFFFFF')
@@ -961,7 +1199,8 @@ function buildDashboard(log) {
   r += 1;
 
   // Date range sub-header row
-  const dateSubRow = ['', last7Label, prior7Label, 'Last 7d vs Prior 7d', fullRangeLabel];
+  const baselineLabel = baselineDates.length > 0 ? `${shortDate(baselineDates[0])} → ${shortDate(baselineDates[baselineDates.length - 1])}` : 'N/A';
+  const dateSubRow = ['', last7Label, prior7Label, 'L7 vs P7', baselineLabel, 'L7 vs Baseline'];
   sheet.getRange(r, 1, 1, dateSubRow.length).setValues([dateSubRow]);
   sheet.getRange(r, 1, 1, dateSubRow.length)
     .setFontSize(9).setFontColor('#666666').setFontStyle('italic')
@@ -970,18 +1209,18 @@ function buildDashboard(log) {
 
   // Metrics: only the 8 that drive decisions. Rest lives in deep_dives.
   const kpiConfig = [
-    { name: 'Spend',       l: last7.spend,       p: prior7.spend,       inv: false, f: allAgg.spend },
-    { name: 'Revenue',     l: last7.revenue,      p: prior7.revenue,     inv: false, f: allAgg.revenue },
-    { name: 'Purchases',   l: last7.purchases,    p: prior7.purchases,   inv: false, f: allAgg.purchases },
-    { name: 'ROAS',        l: last7.roas,         p: prior7.roas,        inv: false, f: allAgg.roas },
-    { name: 'CPA',         l: last7.cpa,          p: prior7.cpa,         inv: true,  f: allAgg.cpa },
-    { name: 'AOV',         l: last7.aov,          p: prior7.aov,         inv: false, f: allAgg.aov },
-    { name: 'CVR',         l: last7.cvr,          p: prior7.cvr,         inv: false, f: allAgg.cvr },
-    { name: 'CPC',         l: last7.cpc,          p: prior7.cpc,         inv: true,  f: allAgg.cpc },
+    { name: 'Spend',       l: last7.spend,       p: prior7.spend,       inv: false, b: baselineNorm.spend },
+    { name: 'Revenue',     l: last7.revenue,      p: prior7.revenue,     inv: false, b: baselineNorm.revenue },
+    { name: 'Purchases',   l: last7.purchases,    p: prior7.purchases,   inv: false, b: baselineNorm.purchases },
+    { name: 'ROAS',        l: last7.roas,         p: prior7.roas,        inv: false, b: baselineNorm.roas },
+    { name: 'CPA',         l: last7.cpa,          p: prior7.cpa,         inv: true,  b: baselineNorm.cpa },
+    { name: 'AOV',         l: last7.aov,          p: prior7.aov,         inv: false, b: baselineNorm.aov },
+    { name: 'CVR',         l: last7.cvr,          p: prior7.cvr,         inv: false, b: baselineNorm.cvr },
+    { name: 'CPC',         l: last7.cpc,          p: prior7.cpc,         inv: true,  b: baselineNorm.cpc },
   ];
 
   const kpiData = kpiConfig.map(m => [
-    m.name, m.l, m.p, trendPct(m.l, m.p, m.inv), m.f
+    m.name, m.l, m.p, trendPct(m.l, m.p, m.inv), m.b, trendPct(m.l, m.b, m.inv)
   ]);
 
   sheet.getRange(r, 1, kpiData.length, kpiHeaders.length).setValues(kpiData);
@@ -1005,28 +1244,28 @@ function buildDashboard(log) {
       sheet.getRange(r + i, 5).setNumberFormat(fmt);
     }
 
-    // Smart WoW coloring — only color meaningful changes
-    const rawPct = trendRawPct(metric.l, metric.p);
-    const absPct = Math.abs(rawPct);
-    const trendCell = sheet.getRange(r + i, 4);
-
-    if (absPct >= WOW_NOISE_FLOOR) {
-      // Significant change — color based on good/bad direction
-      const isGoodDirection = metric.inv ? (rawPct < 0) : (rawPct > 0);
-      if (isGoodDirection) {
-        trendCell.setFontColor('#137333').setFontWeight('bold');
-      } else {
-        // Only go red for big swings (>15%), orange for moderate (5-15%)
-        if (absPct >= 15) {
-          trendCell.setFontColor('#C5221F').setFontWeight('bold');
+    // Smart coloring helper for trend delta columns
+    function colorTrendCell(cell, rawPctVal, isInverted) {
+      const absVal = Math.abs(rawPctVal);
+      if (absVal >= WOW_NOISE_FLOOR) {
+        const isGoodDir = isInverted ? (rawPctVal < 0) : (rawPctVal > 0);
+        if (isGoodDir) {
+          cell.setFontColor('#137333').setFontWeight('bold');
+        } else if (absVal >= 15) {
+          cell.setFontColor('#C5221F').setFontWeight('bold');
         } else {
-          trendCell.setFontColor('#E37400'); // Orange = "heads up" not "panic"
+          cell.setFontColor('#E37400');
         }
+      } else {
+        cell.setFontColor('#888888');
       }
-    } else {
-      // Small change — keep it neutral grey
-      trendCell.setFontColor('#888888');
     }
+
+    // WoW delta coloring (col 4)
+    colorTrendCell(sheet.getRange(r + i, 4), trendRawPct(metric.l, metric.p), metric.inv);
+
+    // vs Baseline delta coloring (col 6)
+    colorTrendCell(sheet.getRange(r + i, 6), trendRawPct(metric.l, metric.b), metric.inv);
 
     // Alternate row shading
     if (i % 2 === 0) {
@@ -1034,12 +1273,12 @@ function buildDashboard(log) {
     }
   }
 
-  // Color-code ROAS cells specifically (Last 7d = col2, Prior 7d = col3, Full Period = col5)
+  // Color-code ROAS cells specifically (Last 7d = col2, Prior 7d = col3, Baseline = col5)
   const roasRowIdx = kpiData.findIndex(d => d[0] === 'ROAS');
   if (roasRowIdx >= 0) {
-    const roasColMap = { 2: 1, 3: 2, 5: 4 }; // sheet col → kpiData array index
     [2, 3, 5].forEach(col => {
-      const val = parseFloat(kpiData[roasRowIdx][roasColMap[col]]) || 0;
+      const colDataIdx = col === 2 ? 1 : col === 3 ? 2 : 4;
+      const val = parseFloat(kpiData[roasRowIdx][colDataIdx]) || 0;
       const cell = sheet.getRange(r + roasRowIdx, col);
       if (val >= T.TARGET_ROAS) cell.setFontColor('#137333').setFontWeight('bold');
       else if (val >= T.KILL_ROAS) cell.setFontColor('#E37400').setFontWeight('bold');
@@ -1108,7 +1347,7 @@ function buildDashboard(log) {
       sheet.setRowHeight(r, 30);
       r += 1;
     } else {
-      sheet.getRange(r, 1, 1, 5).merge();
+      sheet.getRange(r, 1, 1, 6).merge();
       const f = findings[0];
       sheet.getRange(r, 1).setValue(`${f.signal}  ${f.evidence} ${f.action}`);
       sheet.getRange(r, 1).setFontSize(10).setFontColor('#137333').setWrap(true).setFontWeight('bold');
@@ -1116,6 +1355,47 @@ function buildDashboard(log) {
       r += 1;
     }
   }
+
+  // ── BUILD CAMPAIGN DATA (needed by AI insight + campaign table below) ─
+  const campMap = {};
+  dailyRows.forEach(dr2 => {
+    if (!campMap[dr2.campaign]) campMap[dr2.campaign] = { last7: [], prior7: [], source: 'Meta' };
+  });
+  last7Rows.forEach(dr2 => { if (campMap[dr2.campaign]) campMap[dr2.campaign].last7.push(dr2); });
+  prior7Rows.forEach(dr2 => { if (campMap[dr2.campaign]) campMap[dr2.campaign].prior7.push(dr2); });
+
+  // Include Google Ads campaigns if data exists
+  if (hasGoogleAds) {
+    const gAdsSheet2 = CONFIG.TABS.GOOGLE_ADS ? ss.getSheetByName(CONFIG.TABS.GOOGLE_ADS) : null;
+    if (gAdsSheet2 && gAdsSheet2.getLastRow() > 1) {
+      const gh = gAdsSheet2.getRange(1, 1, 1, gAdsSheet2.getLastColumn()).getValues()[0];
+      const gd = gAdsSheet2.getRange(2, 1, gAdsSheet2.getLastRow() - 1, gAdsSheet2.getLastColumn()).getValues();
+      const gIdx = {}; gh.forEach((h, i) => gIdx[h] = i);
+      gd.forEach(row => {
+        let date = row[gIdx['date']];
+        if (date instanceof Date) date = Utilities.formatDate(date, 'UTC', 'yyyy-MM-dd');
+        else date = String(date).substring(0, 10);
+        const name = '🔵 ' + (row[gIdx['campaign']] || 'Google Ads');
+        if (!campMap[name]) campMap[name] = { last7: [], prior7: [], source: 'Google' };
+        const gRow = {
+          date, campaign: name,
+          spend: parseFloat(row[gIdx['spend']]) || 0,
+          revenue: parseFloat(row[gIdx['conversion_value']]) || 0,
+          purchases: parseFloat(row[gIdx['conversions']]) || 0,
+          impressions: parseInt(row[gIdx['impressions']]) || 0,
+          clicks: parseInt(row[gIdx['clicks']]) || 0,
+          atc: 0, reach: 0,
+        };
+        if (last7Dates.includes(date)) campMap[name].last7.push(gRow);
+        if (prior7Dates.includes(date)) campMap[name].prior7.push(gRow);
+      });
+    }
+  }
+
+  const activeCamps = Object.entries(campMap)
+    .map(([name, data]) => ({ name, l: aggregate(data.last7), p: aggregate(data.prior7), source: data.source }))
+    .filter(c => c.l.spend >= 50 || c.p.spend >= 50)
+    .sort((a, b) => b.l.spend - a.l.spend);
 
   // ── AI INSIGHT (if configured) ──────────────────────────────────────
   if (CONFIG.AI.API_KEY) {
@@ -1155,7 +1435,23 @@ function buildDashboard(log) {
         declining: DATA_CACHE.creatives ? DATA_CACHE.creatives.filter(c => c.roasTrend === '▼' && c.phase === 'active').length : 0,
         top_concentration_pct: totalActiveSpend > 0 ? (topCreativeSpend / totalActiveSpend * 100) : 0,
       },
-      thresholds: { target_roas: T.TARGET_ROAS, kill_roas: T.KILL_ROAS, scale_roas: T.SCALE_ROAS }
+      thresholds: { target_roas: T.TARGET_ROAS, kill_roas: T.KILL_ROAS, scale_roas: T.SCALE_ROAS },
+      baseline: {
+        roas: baselineNorm.roas, cpm: baselineNorm.cpm, cpa: baselineNorm.cpa, ctr: baselineNorm.ctr,
+        roas_vs_baseline_pct: pctChange(last7.roas, baselineNorm.roas),
+        cpm_vs_baseline_pct: pctChange(last7.cpm, baselineNorm.cpm),
+      },
+      frequency_model: {
+        learned_threshold: learnedFreqThreshold,
+        source: freqTippingSource,
+        current_freq: avgFreq7,
+      },
+      creative_lifespan: {
+        avg_days: DATA_CACHE.avgCreativeLifespan,
+        at_risk_count: DATA_CACHE.creatives ? DATA_CACHE.creatives.filter(c =>
+          c.phase === 'active' && DATA_CACHE.avgCreativeLifespan && c.ageDays >= DATA_CACHE.avgCreativeLifespan * 0.8
+        ).length : 0,
+      },
     };
 
     const aiInsight = generateAIInsight(aiData);
@@ -1163,7 +1459,7 @@ function buildDashboard(log) {
     if (aiInsight && !aiInsight.startsWith('[AI Error')) {
       sheet.getRange(r, 1).setValue('🤖 AI INSIGHT').setFontWeight('bold').setFontSize(12);
       r += 1;
-      sheet.getRange(r, 1, 1, 5).merge();
+      sheet.getRange(r, 1, 1, 6).merge();
       sheet.getRange(r, 1).setValue(aiInsight).setWrap(true).setVerticalAlignment('top')
         .setFontSize(10).setBackground('#f0f4ff').setFontColor('#1a1a1a');
       // Auto-height based on text length
@@ -1177,46 +1473,70 @@ function buildDashboard(log) {
     }
   }
 
-  // ── CAMPAIGNS WoW (right panel, cols G-M, aligned with KPI) ─────────
-  const campMap = {};
-  dailyRows.forEach(dr2 => {
-    if (!campMap[dr2.campaign]) campMap[dr2.campaign] = { last7: [], prior7: [], source: 'Meta' };
-  });
-  last7Rows.forEach(dr2 => { if (campMap[dr2.campaign]) campMap[dr2.campaign].last7.push(dr2); });
-  prior7Rows.forEach(dr2 => { if (campMap[dr2.campaign]) campMap[dr2.campaign].prior7.push(dr2); });
+  // ── CAMPAIGNS WoW (right panel, aligned with KPI) ─────────────────
+  // (campMap/activeCamps already computed above, before AI section)
 
-  // Include Google Ads campaigns if data exists
-  if (hasGoogleAds) {
-    const gAdsSheet2 = CONFIG.TABS.GOOGLE_ADS ? ss.getSheetByName(CONFIG.TABS.GOOGLE_ADS) : null;
-    if (gAdsSheet2 && gAdsSheet2.getLastRow() > 1) {
-      const gh = gAdsSheet2.getRange(1, 1, 1, gAdsSheet2.getLastColumn()).getValues()[0];
-      const gd = gAdsSheet2.getRange(2, 1, gAdsSheet2.getLastRow() - 1, gAdsSheet2.getLastColumn()).getValues();
-      const gIdx = {}; gh.forEach((h, i) => gIdx[h] = i);
-      gd.forEach(row => {
-        let date = row[gIdx['date']];
-        if (date instanceof Date) date = Utilities.formatDate(date, 'UTC', 'yyyy-MM-dd');
-        else date = String(date).substring(0, 10);
-        const name = '🔵 ' + (row[gIdx['campaign']] || 'Google Ads');
-        if (!campMap[name]) campMap[name] = { last7: [], prior7: [], source: 'Google' };
-        const gRow = {
-          date, campaign: name,
-          spend: parseFloat(row[gIdx['spend']]) || 0,
-          revenue: parseFloat(row[gIdx['conversion_value']]) || 0,
-          purchases: parseFloat(row[gIdx['conversions']]) || 0,
-          impressions: parseInt(row[gIdx['impressions']]) || 0,
-          clicks: parseInt(row[gIdx['clicks']]) || 0,
-          atc: 0, reach: 0,
-        };
-        if (last7Dates.includes(date)) campMap[name].last7.push(gRow);
-        if (prior7Dates.includes(date)) campMap[name].prior7.push(gRow);
-      });
-    }
+  // ── CAMPAIGN HEALTH SCORE ─────────────────────────────────────────────
+  // 0-100 score per campaign: weighted average of 5 dimensions
+  function getCampaignFrequency(campName) {
+    const campAdsets = freq7.filter(r => r.campaign === campName);
+    const totalImpr = campAdsets.reduce((s, r) => s + (r.impressions || 0), 0);
+    const totalReach = campAdsets.reduce((s, r) => s + (r.reach || 0), 0);
+    return totalReach > 0 ? totalImpr / totalReach : 0;
   }
 
-  const activeCamps = Object.entries(campMap)
-    .map(([name, data]) => ({ name, l: aggregate(data.last7), p: aggregate(data.prior7), source: data.source }))
-    .filter(c => c.l.spend >= 50 || c.p.spend >= 50)  // Skip dead/paused campaigns
-    .sort((a, b) => b.l.spend - a.l.spend);
+  function computeHealthScore(campData) {
+    // 1. ROAS Efficiency (35%) — 100 at SCALE, 50 at TARGET, 0 at 0
+    let roasScore = 0;
+    if (campData.l.roas >= T.SCALE_ROAS) roasScore = 100;
+    else if (campData.l.roas >= T.TARGET_ROAS) {
+      roasScore = 50 + 50 * (campData.l.roas - T.TARGET_ROAS) / (T.SCALE_ROAS - T.TARGET_ROAS);
+    } else if (campData.l.roas > 0) {
+      roasScore = 50 * (campData.l.roas / T.TARGET_ROAS);
+    }
+
+    // 2. Frequency Health (15%) — 100 below 1.5x, 0 at critical
+    const campFreq = getCampaignFrequency(campData.name);
+    const freqCeiling = learnedFreqCritical;
+    let freqScore = 100;
+    if (campFreq >= freqCeiling) freqScore = 0;
+    else if (campFreq > 1.5) {
+      freqScore = 100 * (1 - (campFreq - 1.5) / (freqCeiling - 1.5));
+    }
+
+    // 3. WoW Trend (20%) — 100 at +20%, 50 at flat, 0 at -20%
+    const roasWow = campData.p.roas > 0
+      ? ((campData.l.roas - campData.p.roas) / campData.p.roas * 100) : 0;
+    let trendScore = 50 + roasWow * 2.5;
+    trendScore = Math.max(0, Math.min(100, trendScore));
+
+    // 4. Baseline Deviation (15%) — L7 ROAS vs baseline avg
+    let baseScore = 50;
+    if (baselineNorm.roas > 0) {
+      const baseDelta = ((campData.l.roas - baselineNorm.roas) / baselineNorm.roas * 100);
+      baseScore = 50 + baseDelta * 2;
+      baseScore = Math.max(0, Math.min(100, baseScore));
+    }
+
+    // 5. Creative Health (15%) — account-level declining ratio + lifespan risk
+    let creativeScore = 50;
+    if (DATA_CACHE.creatives && DATA_CACHE.creatives.length > 0) {
+      const allActive = DATA_CACHE.creatives.filter(c => c.phase === 'active');
+      const declining = allActive.filter(c => c.roasTrend === '▼');
+      const declineRatio = allActive.length > 0 ? declining.length / allActive.length : 0;
+      creativeScore = 100 * (1 - declineRatio);
+      if (DATA_CACHE.avgCreativeLifespan) {
+        const atRisk = allActive.filter(c => c.ageDays >= DATA_CACHE.avgCreativeLifespan * 0.8);
+        const atRiskRatio = allActive.length > 0 ? atRisk.length / allActive.length : 0;
+        creativeScore -= atRiskRatio * 30;
+        creativeScore = Math.max(0, creativeScore);
+      }
+    }
+
+    return Math.max(0, Math.min(100, Math.round(
+      roasScore * 0.35 + freqScore * 0.15 + trendScore * 0.20 + baseScore * 0.15 + creativeScore * 0.15
+    )));
+  }
 
   const RC = 7; // right column start (col G)
   let rr = kpiStartRow;
@@ -1225,7 +1545,7 @@ function buildDashboard(log) {
   rr += 1;
 
   if (activeCamps.length > 0) {
-    const campHeaders = ['Campaign', 'L7 Spend', 'L7 ROAS', 'L7 CPA', 'L7 Purch', 'ROAS Δ', 'CPA Δ'];
+    const campHeaders = ['Campaign', 'Score', 'L7 Spend', 'L7 ROAS', 'L7 CPA', 'L7 Purch', 'ROAS Δ', 'CPA Δ'];
     sheet.getRange(rr, RC, 1, campHeaders.length).setValues([campHeaders]);
     sheet.getRange(rr, RC, 1, campHeaders.length)
       .setFontWeight('bold').setBackground('#000000').setFontColor('#FFFFFF')
@@ -1233,27 +1553,42 @@ function buildDashboard(log) {
     rr += 1;
 
     activeCamps.forEach((c, i) => {
+      const healthScore = computeHealthScore(c);
+
       sheet.getRange(rr, RC, 1, campHeaders.length).setValues([[
-        c.name, c.l.spend, c.l.roas, c.l.cpa, c.l.purchases,
+        c.name, healthScore, c.l.spend, c.l.roas, c.l.cpa, c.l.purchases,
         trendPct(c.l.roas, c.p.roas, false), trendPct(c.l.cpa, c.p.cpa, true)
       ]]);
-      sheet.getRange(rr, RC + 1).setNumberFormat('"$"#,##0');
-      sheet.getRange(rr, RC + 2).setNumberFormat('0.00"x"');
-      sheet.getRange(rr, RC + 3).setNumberFormat('"$"#,##0.00');
-      sheet.getRange(rr, RC + 4).setNumberFormat('#,##0');
+      sheet.getRange(rr, RC + 2).setNumberFormat('"$"#,##0');
+      sheet.getRange(rr, RC + 3).setNumberFormat('0.00"x"');
+      sheet.getRange(rr, RC + 4).setNumberFormat('"$"#,##0.00');
+      sheet.getRange(rr, RC + 5).setNumberFormat('#,##0');
       sheet.getRange(rr, RC, 1, campHeaders.length).setHorizontalAlignment('center').setVerticalAlignment('middle').setFontSize(9);
       sheet.getRange(rr, RC).setHorizontalAlignment('left').setFontWeight('bold').setFontSize(8);
 
+      // Color health score
+      const scoreCell = sheet.getRange(rr, RC + 1);
+      scoreCell.setNumberFormat('#,##0').setFontWeight('bold');
+      if (healthScore >= 80) {
+        scoreCell.setBackground('#e6f4ea').setFontColor('#137333');
+      } else if (healthScore >= 60) {
+        scoreCell.setFontColor('#137333');
+      } else if (healthScore >= 40) {
+        scoreCell.setBackground('#fef7e0').setFontColor('#E37400');
+      } else {
+        scoreCell.setBackground('#fde8e8').setFontColor('#C5221F');
+      }
+
       // Color ROAS delta
       const rawRD = trendRawPct(c.l.roas, c.p.roas);
-      const rdCell = sheet.getRange(rr, RC + 5);
+      const rdCell = sheet.getRange(rr, RC + 6);
       if (Math.abs(rawRD) < WOW_NOISE_FLOOR) rdCell.setFontColor('#888888');
       else if (rawRD > 0) rdCell.setFontColor('#137333').setFontWeight('bold');
       else if (rawRD < -15) rdCell.setFontColor('#C5221F').setFontWeight('bold');
       else rdCell.setFontColor('#E37400');
 
       // Color ROAS value
-      const roasCell = sheet.getRange(rr, RC + 2);
+      const roasCell = sheet.getRange(rr, RC + 3);
       if (c.l.roas >= T.SCALE_ROAS) roasCell.setBackground('#e6f4ea').setFontColor('#137333');
       else if (c.l.roas >= T.TARGET_ROAS) roasCell.setFontColor('#137333');
       else if (c.l.roas >= T.KILL_ROAS) roasCell.setFontColor('#E37400');
@@ -1277,20 +1612,21 @@ function buildDashboard(log) {
   sheet.setColumnWidth(1, 130);  // Metric / Channel
   sheet.setColumnWidth(2, 110);  // Last 7d / L7 Spend
   sheet.setColumnWidth(3, 110);  // Prior 7d / L7 Revenue
-  sheet.setColumnWidth(4, 95);   // WoW / L7 Purch
-  sheet.setColumnWidth(5, 110);  // Full 30d / L7 ROAS
-  sheet.setColumnWidth(6, 85);   // L7 CPA (channel table uses this)
-  // Right: Campaigns (G-M)
+  sheet.setColumnWidth(4, 95);   // WoW Δ
+  sheet.setColumnWidth(5, 110);  // Baseline Avg
+  sheet.setColumnWidth(6, 85);   // vs Base Δ
+  // Right: Campaigns (G-N)
   sheet.setColumnWidth(7, 175);  // Campaign name
-  sheet.setColumnWidth(8, 80);   // L7 Spend
-  sheet.setColumnWidth(9, 65);   // L7 ROAS
-  sheet.setColumnWidth(10, 75);  // L7 CPA
-  sheet.setColumnWidth(11, 65);  // L7 Purch
-  sheet.setColumnWidth(12, 65);  // ROAS Δ
-  sheet.setColumnWidth(13, 65);  // CPA Δ
+  sheet.setColumnWidth(8, 45);   // Score
+  sheet.setColumnWidth(9, 80);   // L7 Spend
+  sheet.setColumnWidth(10, 65);  // L7 ROAS
+  sheet.setColumnWidth(11, 75);  // L7 CPA
+  sheet.setColumnWidth(12, 60);  // L7 Purch
+  sheet.setColumnWidth(13, 65);  // ROAS Δ
+  sheet.setColumnWidth(14, 65);  // CPA Δ
   // Trim beyond col 13
   try {
-    if (sheet.getMaxColumns() > 13) sheet.deleteColumns(14, sheet.getMaxColumns() - 13);
+    if (sheet.getMaxColumns() > 14) sheet.deleteColumns(15, sheet.getMaxColumns() - 14);
   } catch (e) {}
 
   // Trim empty rows
@@ -1539,46 +1875,16 @@ function buildDashboard(log) {
   dr += 2;
 
   // ── WEEKLY PERFORMANCE CHARTS ─────────────────────────────────────────
+  // (weekBuckets/weekAggs already computed above, before diagnostic engine)
   ddSheet.getRange(dr, 1).setValue('WEEKLY PERFORMANCE CHARTS').setFontWeight('bold').setFontSize(12);
   dr += 1;
 
-  const weekBuckets = {};
-  sortedDates.forEach(dateStr => {
-    const parts = dateStr.split('-');
-    const dateObj = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
-    const day = dateObj.getDay();
-    const mondayOffset = day === 0 ? -6 : 1 - day;
-    const monday = new Date(dateObj);
-    monday.setDate(dateObj.getDate() + mondayOffset);
-    const weekKey = Utilities.formatDate(monday, 'UTC', 'MM/dd');
-    if (!weekBuckets[weekKey]) weekBuckets[weekKey] = [];
-    dailyRows.filter(row2 => row2.date === dateStr).forEach(row2 => weekBuckets[weekKey].push(row2));
-  });
-
-  const weekKeys = Object.keys(weekBuckets).sort();
-  const weekAggs = weekKeys.map(wk => {
-    const a = aggregate(weekBuckets[wk]);
-    const weekDates = Object.keys(dailyTrend).filter(d => {
-      const p = d.split('-');
-      const dObj = new Date(parseInt(p[0]), parseInt(p[1]) - 1, parseInt(p[2]));
-      const dy = dObj.getDay();
-      const mo = dy === 0 ? -6 : 1 - dy;
-      const mon = new Date(dObj);
-      mon.setDate(dObj.getDate() + mo);
-      return Utilities.formatDate(mon, 'UTC', 'MM/dd') === wk;
-    });
-    const weekAdsetRows = adsetRows.filter(ar => weekDates.includes(ar.date));
-    const weekImpr = weekAdsetRows.reduce((s, ar) => s + (ar.impressions || 0), 0);
-    const weekReach = weekAdsetRows.reduce((s, ar) => s + (ar.reach || 0), 0);
-    const avgFreq = weekReach > 0 ? weekImpr / weekReach : 0;
-    return { week: 'Wk ' + wk, ...a, frequency: avgFreq };
-  });
-
   if (weekAggs.length >= 2) {
+    const showFreqCap = freqRoasPairs.length >= 3;
     const chartHeaders = [
       'Week', 'Spend', 'Revenue', 'ROAS', 'Target',
       'Reach', 'Frequency', 'Impressions', 'CTR', 'CVR',
-      'CPA', 'CPM', 'CPC', 'Purchases'
+      'CPA', 'CPM', 'CPC', 'Purchases', 'Freq Cap'
     ];
     ddSheet.getRange(dr, 1, 1, chartHeaders.length).setValues([chartHeaders]);
     ddSheet.getRange(dr, 1, 1, chartHeaders.length)
@@ -1592,7 +1898,8 @@ function buildDashboard(log) {
       w.reach, parseFloat(w.frequency.toFixed(2)),
       w.impressions, parseFloat(w.ctr.toFixed(2)), parseFloat(w.cvr.toFixed(2)),
       parseFloat(w.cpa.toFixed(2)), parseFloat(w.cpm.toFixed(2)),
-      parseFloat(w.cpc.toFixed(2)), w.purchases
+      parseFloat(w.cpc.toFixed(2)), w.purchases,
+      showFreqCap ? parseFloat(learnedFreqThreshold.toFixed(2)) : ''
     ]);
     ddSheet.getRange(dr, 1, chartRows.length, chartHeaders.length).setValues(chartRows);
     ddSheet.getRange(dr, 1, chartRows.length, chartHeaders.length).setFontSize(8).setFontColor('#999999');
@@ -1607,7 +1914,7 @@ function buildDashboard(log) {
     let chartCol = 1;
     const CW = 500, CH = 270, CS = 14;
 
-    function ddChart(type, title, ranges, series, vFmt, v2Fmt) {
+    function ddChart(type, title, ranges, series, vFmt, v2Fmt, subtitle) {
       const b = ddSheet.newChart().setChartType(type)
         .setMergeStrategy(Charts.ChartMergeStrategy.MERGE_COLUMNS);
       b.addRange(ddWeekRange());
@@ -1618,6 +1925,8 @@ function buildDashboard(log) {
         .setOption('legend', { position: 'top', textStyle: { fontSize: 9 } })
         .setOption('hAxis', { textStyle: { fontSize: 8 } })
         .setOption('bar', { groupWidth: '65%' });
+      if (subtitle) b.setOption('subtitle', subtitle)
+        .setOption('subtitleTextStyle', { fontSize: 8, italic: true, color: '#1967d2' });
       if (v2Fmt) b.setOption('vAxes', { 0: { format: vFmt, textStyle: { fontSize: 9 } }, 1: { format: v2Fmt, textStyle: { fontSize: 9 } } });
       else b.setOption('vAxis', { format: vFmt, textStyle: { fontSize: 9 } });
       if (series) b.setOption('series', series);
@@ -1630,17 +1939,32 @@ function buildDashboard(log) {
       { 0: { color: '#4285F4' }, 1: { color: '#34A853' } }, '$#,##0');
     ddChart(Charts.ChartType.LINE, 'Weekly ROAS vs ' + T.TARGET_ROAS + 'x Target', ['ROAS', 'Target'],
       { 0: { color: '#4285F4', lineWidth: 2, pointSize: 5 }, 1: { color: '#EA4335', lineWidth: 2, lineDashStyle: [4, 4], pointSize: 0 } }, '0.0');
-    ddChart(Charts.ChartType.COMBO, 'Reach & Frequency', ['Reach', 'Frequency'],
-      { 0: { type: 'bars', color: '#4285F4', targetAxisIndex: 0 }, 1: { type: 'line', color: '#34A853', lineWidth: 2, pointSize: 5, targetAxisIndex: 1 } }, '#,##0', '0.0');
+    const freqRanges = showFreqCap ? ['Reach', 'Frequency', 'Freq Cap'] : ['Reach', 'Frequency'];
+    const freqSeries = showFreqCap
+      ? { 0: { type: 'bars', color: '#4285F4', targetAxisIndex: 0 },
+          1: { type: 'line', color: '#34A853', lineWidth: 2, pointSize: 5, targetAxisIndex: 1 },
+          2: { type: 'line', color: '#EA4335', lineWidth: 1, lineDashStyle: [4, 4], pointSize: 0, targetAxisIndex: 1 } }
+      : { 0: { type: 'bars', color: '#4285F4', targetAxisIndex: 0 },
+          1: { type: 'line', color: '#34A853', lineWidth: 2, pointSize: 5, targetAxisIndex: 1 } };
+    const freqSubtitle = showFreqCap
+      ? (freqTippingSource === 'learned'
+          ? 'ROAS tipping point: ' + learnedFreqThreshold.toFixed(1) + 'x frequency'
+          : 'Safe zone: up to ' + learnedFreqThreshold.toFixed(1) + 'x (' + freqRoasPairs.length + ' wks of data)')
+      : null;
+    ddChart(Charts.ChartType.COMBO, 'Reach & Frequency', freqRanges, freqSeries, '#,##0', '0.0', freqSubtitle);
     ddChart(Charts.ChartType.COMBO, 'Purchases & CPA', ['Purchases', 'CPA'],
       { 0: { type: 'bars', color: '#4285F4', targetAxisIndex: 0 }, 1: { type: 'line', color: '#EA4335', lineWidth: 2, pointSize: 5, targetAxisIndex: 1 } }, '#,##0', '$#,##0');
     ddChart(Charts.ChartType.COMBO, 'CTR & CPM', ['CTR', 'CPM'],
       { 0: { type: 'line', color: '#4285F4', lineWidth: 2, pointSize: 5, targetAxisIndex: 0 }, 1: { type: 'line', color: '#E37400', lineWidth: 2, pointSize: 5, targetAxisIndex: 1 } }, '0.0"%"', '$#,##0');
     ddChart(Charts.ChartType.COMBO, 'CVR & CPC', ['CVR', 'CPC'],
       { 0: { type: 'line', color: '#137333', lineWidth: 2, pointSize: 5, targetAxisIndex: 0 }, 1: { type: 'line', color: '#E37400', lineWidth: 2, pointSize: 5, targetAxisIndex: 1 } }, '0.0"%"', '$0.00');
+
+    // Skip past chart visual area before writing anything else
+    // chartRow tracks the last chart position; advance dr past both data rows and chart visuals
+    dr = Math.max(dr + chartRows.length, chartRow + CS);
   }
 
-  for (let c = 1; c <= 14; c++) ddSheet.setColumnWidth(c, 100);
+  for (let c = 1; c <= 15; c++) ddSheet.setColumnWidth(c, 100);
   ddSheet.setColumnWidth(1, 130);
 
   // ══════════════════════════════════════════════════════════════════════
@@ -2137,7 +2461,7 @@ function syncMetaAdsetDaily(log) {
 
 function syncMetaCreative(log) {
   const T = CONFIG.THRESHOLDS;
-  const { creativeMap: thumbnailMap, statusMap } = fetchAdThumbnails(log);
+  const { creativeMap: thumbnailMap, statusMap, createdMap } = fetchAdThumbnails(log);
 
   const fields = [
     'ad_id', 'ad_name', 'spend', 'impressions', 'reach', 'clicks',
@@ -2321,14 +2645,35 @@ function syncMetaCreative(log) {
       else roasTrend = '—';
     }
 
+    // Creative age — how many days since this ad was created
+    const createdTime = createdMap[adId] || '';
+    const createdDate = createdTime ? createdTime.substring(0, 10) : '';
+    const ageDays = createdDate
+      ? Math.floor((new Date() - new Date(createdDate)) / (1000 * 60 * 60 * 24))
+      : 0;
+
     return {
       name: adName, imgUrl, status, phase, roasTrend,
-      full, recent, isNew
+      full, recent, isNew, ageDays, createdDate
     };
   });
 
   // Cache for action items engine
   DATA_CACHE.creatives = allCreatives;
+
+  // ── CREATIVE LIFESPAN MODEL ──────────────────────────────────────────
+  // Find "burned out" creatives: were profitable overall but now dead or declining
+  const burnedOut = allCreatives.filter(c =>
+    c.full.spend > T.TESTING_SPEND_CAP &&
+    c.full.roas >= T.TARGET_ROAS &&
+    c.ageDays > 0 &&
+    (c.phase === 'inactive' || c.recent.roas < T.TARGET_ROAS)
+  );
+  if (burnedOut.length >= 2) {
+    DATA_CACHE.avgCreativeLifespan = Math.round(
+      burnedOut.reduce((s, c) => s + c.ageDays, 0) / burnedOut.length
+    );
+  }
 
   // Detect creative format for language
   const hasVideoAds = allCreatives.some(c =>
@@ -2544,6 +2889,70 @@ function syncMetaCreative(log) {
       .setFontColor('#E37400').setFontWeight('bold');
     r += 2;
   } else {
+    r += 1;
+  }
+
+  // ── CREATIVE LIFESPAN SECTION ─────────────────────────────────────────
+  if (DATA_CACHE.avgCreativeLifespan) {
+    sheet.getRange(r, 1).setValue('CREATIVE LIFESPAN').setFontWeight('bold').setFontSize(12);
+    r += 1;
+
+    const avgLife = DATA_CACHE.avgCreativeLifespan;
+    sheet.getRange(r, 1, 1, 8).merge();
+    sheet.getRange(r, 1).setValue(
+      `Your winning creatives run ~${avgLife} days on average before ROAS drops below ${T.TARGET_ROAS}x target. ` +
+      `Creatives approaching this age are flagged below.`
+    ).setFontSize(9).setFontStyle('italic').setFontColor('#333333').setWrap(true)
+      .setBackground('#f0f4ff').setVerticalAlignment('middle');
+    sheet.setRowHeight(r, 30);
+    r += 1;
+
+    // Show active creatives with age warnings
+    const activeWithAge = allCreatives
+      .filter(c => c.phase === 'active' && c.ageDays > 0 && c.recent.spend > 0)
+      .sort((a, b) => b.ageDays - a.ageDays);
+
+    if (activeWithAge.length > 0) {
+      const lifeHeaders = ['Ad Name', 'Age (days)', 'Status', '7d ROAS', 'Trend', 'Lifespan Warning'];
+      sheet.getRange(r, 1, 1, lifeHeaders.length).setValues([lifeHeaders]);
+      sheet.getRange(r, 1, 1, lifeHeaders.length)
+        .setFontWeight('bold').setBackground('#000000').setFontColor('#FFFFFF')
+        .setHorizontalAlignment('center').setFontSize(9);
+      r += 1;
+
+      activeWithAge.forEach((c, i) => {
+        const pctOfLife = avgLife > 0 ? (c.ageDays / avgLife * 100) : 0;
+        let warning = '';
+        let warnColor = '#888888';
+        if (pctOfLife >= 100) {
+          warning = `⚠️ Past avg lifespan (${avgLife}d)`;
+          warnColor = '#C5221F';
+        } else if (pctOfLife >= 80) {
+          warning = `Approaching burnout (~${Math.round(avgLife - c.ageDays)}d left)`;
+          warnColor = '#E37400';
+        } else {
+          warning = `${Math.round(avgLife - c.ageDays)}d runway remaining`;
+          warnColor = '#137333';
+        }
+
+        sheet.getRange(r, 1, 1, lifeHeaders.length).setValues([[
+          c.name, c.ageDays, c.status, c.recent.roas, c.roasTrend, warning
+        ]]);
+        sheet.getRange(r, 4).setNumberFormat('0.00"x"');
+        sheet.getRange(r, 1, 1, lifeHeaders.length).setHorizontalAlignment('center').setVerticalAlignment('middle').setFontSize(9);
+        sheet.getRange(r, 1).setHorizontalAlignment('left');
+        sheet.getRange(r, 6).setHorizontalAlignment('left').setFontColor(warnColor).setFontWeight('bold');
+
+        if (pctOfLife >= 100) {
+          sheet.getRange(r, 1, 1, lifeHeaders.length).setBackground('#fde8e8');
+        } else if (pctOfLife >= 80) {
+          sheet.getRange(r, 1, 1, lifeHeaders.length).setBackground('#fef7e0');
+        } else if (i % 2 === 0) {
+          sheet.getRange(r, 1, 1, lifeHeaders.length).setBackground('#fafafa');
+        }
+        r++;
+      });
+    }
     r += 1;
   }
 
@@ -2955,13 +3364,14 @@ function getDateRange() {
 }
 
 function fetchAdThumbnails(log) {
-  // Fetch thumbnails AND effective_status — effective_status accounts for parent campaign/adset being paused
-  const fieldsString = encodeURIComponent('id,name,effective_status,creative{thumbnail_url,image_url}');
+  // Fetch thumbnails, effective_status, AND created_time — no extra API call
+  const fieldsString = encodeURIComponent('id,name,effective_status,created_time,creative{thumbnail_url,image_url}');
   let url = `https://graph.facebook.com/${CONFIG.API_VERSION}/${CONFIG.AD_ACCOUNT_ID}/ads?fields=${fieldsString}&limit=500&access_token=${CONFIG.ACCESS_TOKEN}`;
 
   let creativeMap = {};   // ad_id → thumbnail_url
   let statusMap = {};     // ad_id → effective_status
   let nameStatusMap = {}; // ad_name → effective_status (for matching with insights which group by name)
+  let createdMap = {};    // ad_id → created_time ISO string
   let pageCount = 0;
 
   while (url && pageCount < 20) {
@@ -2986,6 +3396,9 @@ function fetchAdThumbnails(log) {
               }
             }
           }
+          if (ad.created_time) {
+            createdMap[ad.id] = ad.created_time;
+          }
         });
       }
       url = json.paging && json.paging.next ? json.paging.next : null;
@@ -2996,7 +3409,7 @@ function fetchAdThumbnails(log) {
     pageCount++;
   }
 
-  return { creativeMap, statusMap, nameStatusMap };
+  return { creativeMap, statusMap, nameStatusMap, createdMap };
 }
 
 
