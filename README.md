@@ -30,6 +30,9 @@ This script pulls data from Meta's API into Google Sheets. It includes a built-i
 
 All five features run with **zero additional API calls** — pure in-memory computation added to the existing sync pipeline.
 
+![Creative Lifespan](assets/creative%20lifespan.png)
+*Creative Lifespan Tracking with Burnout Warnings*
+
 ![Meta KPIs](assets/meta_deep_dives_kpi.png)
 *Detailed Meta Metric Analysis*
 
