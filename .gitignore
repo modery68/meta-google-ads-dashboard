@@ -1,0 +1,16 @@
+# Python virtual environment (auto-created by tooling, never commit this)
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Excel / data files (raw data, don't expose publicly)
+*.xlsx
+*.csv
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
