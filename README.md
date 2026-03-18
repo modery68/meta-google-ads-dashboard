@@ -67,3 +67,14 @@ This script executes inside Google Ads and pushes 4 specialized data sets to the
 
 ## The Output
 Once both scripts are set up and scheduled, you will have a single Google Sheet serving as an end-to-end mission control. It updates continuously, highlighting exactly what to scale, what to kill, and where your creative and funnel opportunities lie.
+
+---
+
+## Known Limitations
+
+### 🔍 PMax Search Terms — Not Available via Scripts
+The `google_ads_search` tab only shows search terms from **active Search and Shopping campaigns**.
+
+**PMax (Performance Max) search term data is not accessible through Google Ads Scripts.** Google's `pmax_search_term_insight` resource is only available via the Google Ads REST API — it was never added to the Scripts runtime.
+
+**Workaround:** In the Google Ads UI, go to **Campaigns → [Your PMax campaign] → Insights → Search terms** to view them manually. For PMax, the `google_ads_products` tab is generally more actionable — PMax optimizes for products, not keywords.
