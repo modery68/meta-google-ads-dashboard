@@ -2,7 +2,7 @@
 
 This repository contains two scripts designed to synchronize advertising data from **Meta Ads** and **Google Ads** directly into **Google Sheets**. Together, they form an automated performance dashboard to track KPIs, find creative fatigue, and highlight actionable insights.
 
-![Overview](assets/dashboard_overview.png)
+![Overview](assets/new_dashboard.png)
 *Automated Dashboard with AI Insights*
 
 ![Campaigns](assets/campaigns_wow.png)
