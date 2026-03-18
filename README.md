@@ -17,9 +17,18 @@ This script pulls data from Meta's API into Google Sheets. It includes a built-i
 *Creative Scoring and Fatigue Detection Tab*
 
 ### Features
-- **Dashboard Construction**: Aggregates top-level numbers and flags issues (e.g., Roas dropped, CPC spikes).
+- **Dashboard Construction**: Aggregates top-level numbers and flags issues (e.g., ROAS dropped, CPC spikes).
 - **Creative & Ad Set Deep Dives**: Tracks performance per ad set and tracks creative engagement metrics (Thumbstop, Hold Rate).
 - **AI Integration**: Optionally plug in a Claude or Gemini API key for advanced AI insights on your ad performance.
+
+#### v2 — Intelligent Diagnostics (New)
+- **Campaign Health Score** — A 0–100 composite score per campaign combining ROAS efficiency, frequency health, WoW trend, baseline deviation, and creative vitality. Color-coded in the campaign table for instant triage.
+- **Frequency → ROAS Correlation** — Learns your account-specific frequency threshold where ROAS starts declining (instead of using a fixed number). Plotted as a dashed red threshold line directly on the Reach & Frequency chart.
+- **Rolling Baseline Anomaly Detection** — Augments WoW comparison with a 4-week rolling baseline average. Catches slow drifts in CPM, ROAS, CPA, and CTR that week-over-week alone misses.
+- **Budget Pacing Tracker** — Projects end-of-month spend based on your daily run rate. Color-coded variance bar (set `MONTHLY_BUDGET` in CONFIG to enable).
+- **Creative Lifespan Model** — Computes your account's average creative lifespan from historical burnout data and warns when active winners are approaching the typical expiry window.
+
+All five features run with **zero additional API calls** — pure in-memory computation added to the existing sync pipeline.
 
 ![Meta KPIs](assets/meta_deep_dives_kpi.png)
 *Detailed Meta Metric Analysis*
