@@ -3186,7 +3186,7 @@ function syncMetaCreative(log) {
     sheet.setRowHeight(r, 30);
     r += 1;
 
-    const fatigueHeaders = ['Thumbnail', 'Ad Name', 'Avg Freq', 'CTR (early)', 'CTR (late)', 'CTR Δ', 'Fatigue Signal'];
+    const fatigueHeaders = ['Thumbnail', 'Ad Name', 'Avg Freq', 'CTR (Days 1-3)', 'CTR (Days 4-7)', 'CTR Δ', 'Fatigue Signal'];
     sheet.getRange(r, 1, 1, fatigueHeaders.length).setValues([fatigueHeaders]);
     sheet.getRange(r, 1, 1, fatigueHeaders.length)
       .setFontWeight('bold').setBackground('#1a1a2e').setFontColor('#FFFFFF')
@@ -3246,9 +3246,112 @@ function syncMetaCreative(log) {
     testing
   );
 
-  writeCreativeSection(
+  // ── ACTIVE PERFORMERS (Custom Deep-Dive Table) ────────────────────────
+  function writeActivePerformersSection(sectionTitle, sectionSubtitle, creatives) {
+    sheet.getRange(r, 1).setValue(sectionTitle).setFontWeight('bold').setFontSize(12);
+    r += 1;
+    sheet.getRange(r, 1).setValue(sectionSubtitle).setFontSize(9).setFontColor('#666666').setFontStyle('italic');
+    r += 1;
+
+    const headers = ['Thumb', 'Status', 'Ad Name', '7d Spend', '% Spend', '7d Rev', '7d ROAS', '7d CPA', 'All ROAS', 'Decay %', '7d Trend', 'Urgency'];
+    sheet.getRange(r, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(r, 1, 1, headers.length)
+      .setFontWeight('bold').setBackground('#1a3a5c').setFontColor('#FFFFFF')
+      .setHorizontalAlignment('center').setVerticalAlignment('middle').setFontSize(9);
+    r += 1;
+
+    if (creatives.length === 0) {
+      sheet.getRange(r, 1).setValue('No creatives in this category');
+      sheet.getRange(r, 1).setFontColor('#888888').setFontStyle('italic');
+      r += 2;
+      return;
+    }
+
+    const totalActiveSpend = creatives.reduce((sum, c) => sum + c.recent.spend, 0);
+
+    creatives.forEach((c, i) => {
+      const imageFormula = c.imgUrl ? `=IMAGE("${c.imgUrl}")` : '';
+      const rec = c.recent;
+      const all = c.full;
+
+      const pctSpend = totalActiveSpend > 0 ? (rec.spend / totalActiveSpend) * 100 : 0;
+      const decayPct = all.roas > 0 ? ((rec.roas - all.roas) / all.roas) * 100 : 0;
+
+      // Urgency heuristic
+      let urgency = '🟢 STABLE';
+      let urgColor = '#137333';
+      if (decayPct <= -20 && pctSpend >= 10 && rec.roas < T.TARGET_ROAS) {
+        urgency = '🔴 URGENT REPLACEMENT';
+        urgColor = '#C5221F';
+      } else if (decayPct <= -10 || (pctSpend >= 20 && rec.roas < T.TARGET_ROAS)) {
+        urgency = '🟡 NEEDS BACKUP';
+        urgColor = '#E37400';
+      }
+
+      // 7d Daily Trend Sparkline
+      let sparkFormula = '';
+      const adId = Object.keys(fullRollup).find(id => fullRollup[id].ad_name === c.name);
+      if (adId && adDailyMap[adId]) {
+        const dailies = adDailyMap[adId];
+        const cTrs = dailies.map(d => d.ctr || 0);
+        if (cTrs.length >= 2) {
+          const sparkColor = cTrs[cTrs.length - 1] >= cTrs[cTrs.length - 2] ? '#137333' : '#C5221F';
+          sparkFormula = `=SPARKLINE({${cTrs.map(v => v.toFixed(2)).join(',')}}, {"charttype","column";"color","${sparkColor}"})`;
+        }
+      }
+
+      sheet.getRange(r, 1, 1, headers.length).setValues([[
+        imageFormula, c.status, c.name,
+        rec.spend, pctSpend / 100, rec.revenue, rec.roas, rec.cpa,
+        all.roas, decayPct / 100, '', urgency
+      ]]);
+
+      if (sparkFormula) sheet.getRange(r, 11).setFormula(sparkFormula);
+
+      // Formatting
+      sheet.getRange(r, 4).setNumberFormat('"$"#,##0'); // Spend
+      sheet.getRange(r, 5).setNumberFormat('0.0"%"');   // % Spend
+      sheet.getRange(r, 6).setNumberFormat('"$"#,##0'); // Rev
+      sheet.getRange(r, 7).setNumberFormat('0.00"x"');  // 7d ROAS
+      sheet.getRange(r, 8).setNumberFormat('"$"#,##0.00'); // CPA
+      sheet.getRange(r, 9).setNumberFormat('0.00"x"');  // All ROAS
+      sheet.getRange(r, 10).setNumberFormat('0.0"%"');   // Decay %
+
+      // Alignment Colors
+      sheet.getRange(r, 1, 1, headers.length).setHorizontalAlignment('center').setVerticalAlignment('middle').setFontSize(9);
+      sheet.getRange(r, 3).setHorizontalAlignment('left'); // Ad Name
+      
+      const roas7Cell = sheet.getRange(r, 7);
+      if (rec.roas >= T.SCALE_ROAS) roas7Cell.setBackground('#e6f4ea').setFontColor('#137333').setFontWeight('bold');
+      else if (rec.roas >= T.TARGET_ROAS) roas7Cell.setFontColor('#137333');
+      else if (rec.roas >= T.KILL_ROAS) roas7Cell.setFontColor('#E37400');
+      else if (rec.spend > 0) roas7Cell.setFontColor('#C5221F');
+
+      const decayCell = sheet.getRange(r, 10);
+      if (decayPct <= -15) decayCell.setFontColor('#C5221F').setFontWeight('bold');
+      else if (decayPct > 0) decayCell.setFontColor('#137333');
+
+      // Status color
+      const statusCell = sheet.getRange(r, 2);
+      if (c.status.includes('🟢') || c.status.includes('✅')) statusCell.setBackground('#e6f4ea');
+      else if (c.status.includes('🟡')) statusCell.setBackground('#fef7e0');
+      else if (c.status.includes('🔴')) statusCell.setBackground('#fde8e8');
+      else if (c.status.includes('🧪')) statusCell.setBackground('#e8eaf6');
+      else if (c.status.includes('⏸️')) statusCell.setBackground('#f5f5f5');
+
+      sheet.getRange(r, headers.length).setFontColor(urgColor).setFontWeight('bold'); // Urgency
+
+      if (urgency.includes('🔴')) sheet.getRange(r, 1, 1, headers.length).setBackground('#fde8e8');
+      else if (i % 2 === 0) sheet.getRange(r, 1, 1, headers.length).setBackground('#fafafa');
+
+      r++;
+    });
+    r += 1; // spacing
+  }
+
+  writeActivePerformersSection(
     '📊 ACTIVE PERFORMERS — How Your Proven Creatives Are Doing Now',
-    `Creatives with history. "7d" = this week. "Trend" = 7d ROAS vs all-time. Only showing ads with recent spend.`,
+    `Deep dive into active winners. "Trend" = 7d Daily CTR sparkline.`,
     active
   );
 
