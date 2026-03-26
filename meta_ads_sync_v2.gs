@@ -294,6 +294,37 @@ function buildDashboard(log) {
     return ((current - previous) / previous) * 100;
   }
 
+  // ── PLACEMENT BREAKDOWN — Fetch by publisher_platform ────────────────
+  function fetchPlacementBreakdown(sinceDate, untilDate) {
+    const url = `https://graph.facebook.com/${CONFIG.API_VERSION}/${CONFIG.AD_ACCOUNT_ID}/insights` +
+      `?access_token=${CONFIG.ACCESS_TOKEN}` +
+      `&time_range=${encodeURIComponent(`{"since":"${sinceDate}","until":"${untilDate}"}`)}` +
+      `&level=account&time_increment=all_days&breakdowns=publisher_platform` +
+      `&fields=spend,impressions,clicks,reach,actions,action_values&limit=50`;
+    try {
+      const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+      if (resp.getResponseCode() === 200) {
+        const json = JSON.parse(resp.getContentText());
+        if (json.data) {
+          return json.data.map(row => ({
+            platform: row.publisher_platform || 'Unknown',
+            spend: parseFloat(row.spend) || 0,
+            impressions: parseInt(row.impressions) || 0,
+            clicks: parseInt(row.clicks) || 0,
+            reach: parseInt(row.reach) || 0,
+            purchases: extractAction(row.actions, 'omni_purchase') || 0,
+            revenue: extractAction(row.action_values, 'omni_purchase') || 0,
+          }));
+        }
+      }
+    } catch (e) { /* fail silently */ }
+    return [];
+  }
+
+  const placementL7 = last7Dates.length > 0
+    ? fetchPlacementBreakdown(last7Dates[0], last7Dates[last7Dates.length - 1])
+    : [];
+
   // ── READ ADSET DATA FOR PER-ADSET FREQUENCY IN DIAGNOSTICS ────────────
   const adsetSheet = ss.getSheetByName(CONFIG.TABS.META_ADSET);
   let adsetRows = [];
@@ -1545,7 +1576,23 @@ function buildDashboard(log) {
   rr += 1;
 
   if (activeCamps.length > 0) {
-    const campHeaders = ['Campaign', 'Score', 'L7 Spend', 'L7 ROAS', 'L7 CPA', 'L7 Purch', 'ROAS Δ', 'CPA Δ'];
+    // ── Build per-campaign weekly ROAS for sparklines ──────────────────
+    const campWeeklyRoas = {};
+    weekKeys.forEach(wk => {
+      const weekRows = weekBuckets[wk];
+      const byCamp = {};
+      weekRows.forEach(row => {
+        if (!byCamp[row.campaign]) byCamp[row.campaign] = { spend: 0, revenue: 0 };
+        byCamp[row.campaign].spend += row.spend;
+        byCamp[row.campaign].revenue += row.revenue;
+      });
+      Object.entries(byCamp).forEach(([name, d]) => {
+        if (!campWeeklyRoas[name]) campWeeklyRoas[name] = [];
+        campWeeklyRoas[name].push(d.spend > 0 ? d.revenue / d.spend : 0);
+      });
+    });
+
+    const campHeaders = ['Campaign', 'Score', 'L7 Spend', 'L7 ROAS', 'L7 CPA', 'L7 Purch', 'ROAS Δ', 'CPA Δ', 'ROAS Trend'];
     sheet.getRange(rr, RC, 1, campHeaders.length).setValues([campHeaders]);
     sheet.getRange(rr, RC, 1, campHeaders.length)
       .setFontWeight('bold').setBackground('#000000').setFontColor('#FFFFFF')
@@ -1555,10 +1602,22 @@ function buildDashboard(log) {
     activeCamps.forEach((c, i) => {
       const healthScore = computeHealthScore(c);
 
-      sheet.getRange(rr, RC, 1, campHeaders.length).setValues([[
+      // Build sparkline formula from weekly ROAS data
+      const weeklyVals = campWeeklyRoas[c.name] || [];
+      let sparkFormula = '';
+      if (weeklyVals.length >= 2) {
+        const sparkColor = weeklyVals[weeklyVals.length - 1] >= weeklyVals[weeklyVals.length - 2] ? '#137333' : '#C5221F';
+        sparkFormula = `=SPARKLINE({${weeklyVals.map(v => v.toFixed(2)).join(',')}}, {"charttype","line";"linewidth",2;"color","${sparkColor}"})`;
+      }
+
+      sheet.getRange(rr, RC, 1, campHeaders.length - 1).setValues([[
         c.name, healthScore, c.l.spend, c.l.roas, c.l.cpa, c.l.purchases,
         trendPct(c.l.roas, c.p.roas, false), trendPct(c.l.cpa, c.p.cpa, true)
       ]]);
+      // Set sparkline in separate cell (formula)
+      if (sparkFormula) {
+        sheet.getRange(rr, RC + 8).setFormula(sparkFormula);
+      }
       sheet.getRange(rr, RC + 2).setNumberFormat('"$"#,##0');
       sheet.getRange(rr, RC + 3).setNumberFormat('0.00"x"');
       sheet.getRange(rr, RC + 4).setNumberFormat('"$"#,##0.00');
@@ -1624,9 +1683,10 @@ function buildDashboard(log) {
   sheet.setColumnWidth(12, 60);  // L7 Purch
   sheet.setColumnWidth(13, 65);  // ROAS Δ
   sheet.setColumnWidth(14, 65);  // CPA Δ
-  // Trim beyond col 13
+  sheet.setColumnWidth(15, 120); // ROAS Trend sparkline
+  // Trim beyond col 15
   try {
-    if (sheet.getMaxColumns() > 14) sheet.deleteColumns(15, sheet.getMaxColumns() - 14);
+    if (sheet.getMaxColumns() > 15) sheet.deleteColumns(16, sheet.getMaxColumns() - 15);
   } catch (e) {}
 
   // Trim empty rows
@@ -1873,6 +1933,72 @@ function buildDashboard(log) {
     ddSheet.getRange(dr, c).setNumberFormat(fmts[String(c)]);
   });
   dr += 2;
+
+  // ── PLACEMENT PERFORMANCE ────────────────────────────────────────────
+  if (placementL7.length > 0) {
+    ddSheet.getRange(dr, 1).setValue('PLACEMENT PERFORMANCE (L7)').setFontWeight('bold').setFontSize(12);
+    dr += 1;
+
+    const totalPlacementSpend = placementL7.reduce((s, p) => s + p.spend, 0);
+
+    // Compute derived metrics
+    const placementRows = placementL7
+      .map(p => ({
+        platform: p.platform.charAt(0).toUpperCase() + p.platform.slice(1).replace(/_/g, ' '),
+        spend: p.spend,
+        revenue: p.revenue,
+        roas: p.spend > 0 ? p.revenue / p.spend : 0,
+        cpa: p.purchases > 0 ? p.spend / p.purchases : 0,
+        purchases: p.purchases,
+        ctr: p.impressions > 0 ? (p.clicks / p.impressions * 100) : 0,
+        cvr: p.clicks > 0 ? (p.purchases / p.clicks * 100) : 0,
+        pctOfSpend: totalPlacementSpend > 0 ? (p.spend / totalPlacementSpend * 100) : 0,
+      }))
+      .sort((a, b) => b.spend - a.spend);
+
+    const plHeaders = ['Platform', 'Spend', 'Revenue', 'ROAS', 'CPA', 'Purch', 'CTR', 'CVR', '% of Spend'];
+    ddSheet.getRange(dr, 1, 1, plHeaders.length).setValues([plHeaders]);
+    ddSheet.getRange(dr, 1, 1, plHeaders.length)
+      .setFontWeight('bold').setBackground('#000000').setFontColor('#FFFFFF')
+      .setHorizontalAlignment('center').setFontSize(9);
+    dr += 1;
+
+    // Find best ROAS platform for highlighting
+    const bestRoasPlatform = placementRows.reduce((best, p) =>
+      (p.roas > best.roas && p.spend > 0) ? p : best, { roas: 0 });
+
+    placementRows.forEach((p, i) => {
+      ddSheet.getRange(dr, 1, 1, plHeaders.length).setValues([[
+        p.platform, p.spend, p.revenue, p.roas, p.cpa, p.purchases, p.ctr, p.cvr, p.pctOfSpend
+      ]]);
+      ddSheet.getRange(dr, 2).setNumberFormat('"$"#,##0');
+      ddSheet.getRange(dr, 3).setNumberFormat('"$"#,##0');
+      ddSheet.getRange(dr, 4).setNumberFormat('0.00"x"');
+      ddSheet.getRange(dr, 5).setNumberFormat('"$"#,##0.00');
+      ddSheet.getRange(dr, 6).setNumberFormat('#,##0');
+      ddSheet.getRange(dr, 7).setNumberFormat('0.00"%"');
+      ddSheet.getRange(dr, 8).setNumberFormat('0.00"%"');
+      ddSheet.getRange(dr, 9).setNumberFormat('0.0"%"');
+      ddSheet.getRange(dr, 1, 1, plHeaders.length).setHorizontalAlignment('center').setVerticalAlignment('middle').setFontSize(9);
+      ddSheet.getRange(dr, 1).setHorizontalAlignment('left').setFontWeight('bold');
+
+      // Color ROAS
+      const roasCell = ddSheet.getRange(dr, 4);
+      if (p.roas >= T.SCALE_ROAS) roasCell.setFontColor('#137333').setFontWeight('bold');
+      else if (p.roas >= T.TARGET_ROAS) roasCell.setFontColor('#137333');
+      else if (p.roas >= T.KILL_ROAS) roasCell.setFontColor('#E37400');
+      else if (p.spend > 0) roasCell.setFontColor('#C5221F');
+
+      // Highlight best ROAS platform row
+      if (p.platform === bestRoasPlatform.platform && p.roas >= T.TARGET_ROAS) {
+        ddSheet.getRange(dr, 1, 1, plHeaders.length).setBackground('#e6f4ea');
+      } else if (i % 2 === 0) {
+        ddSheet.getRange(dr, 1, 1, plHeaders.length).setBackground('#fafafa');
+      }
+      dr++;
+    });
+    dr += 2;
+  }
 
   // ── WEEKLY PERFORMANCE CHARTS ─────────────────────────────────────────
   // (weekBuckets/weekAggs already computed above, before diagnostic engine)
@@ -2503,6 +2629,45 @@ function syncMetaCreative(log) {
     if (r7Url) Utilities.sleep(500);
   }
 
+  // ── Third call: daily granularity for fatigue detection ────────────────
+  const dailyAdUrl = `https://graph.facebook.com/${CONFIG.API_VERSION}/${CONFIG.AD_ACCOUNT_ID}/insights` +
+    `?access_token=${CONFIG.ACCESS_TOKEN}` +
+    `&time_range=${encodeURIComponent(`{"since":"${since7Str}","until":"${untilStr}"}`)}` +
+    `&level=ad&time_increment=1&fields=ad_id,ad_name,impressions,clicks,frequency&limit=500`;
+
+  let dailyAdData = [];
+  let daUrl = dailyAdUrl;
+  let daPages = 0;
+  while (daUrl && daPages < 20) {
+    const resp = UrlFetchApp.fetch(daUrl, { muteHttpExceptions: true });
+    if (resp.getResponseCode() === 200) {
+      const json = JSON.parse(resp.getContentText());
+      if (json.data) dailyAdData = dailyAdData.concat(json.data);
+      daUrl = json.paging && json.paging.next ? json.paging.next : null;
+    } else {
+      log.push(`DailyAd fatigue API error: ${resp.getResponseCode()}`);
+      break;
+    }
+    daPages++;
+    if (daUrl) Utilities.sleep(500);
+  }
+
+  // Build per-ad daily arrays for fatigue analysis
+  const adDailyMap = {};
+  dailyAdData.forEach(row => {
+    const adId = row.ad_id;
+    if (!adDailyMap[adId]) adDailyMap[adId] = [];
+    adDailyMap[adId].push({
+      date: row.date_start,
+      impressions: parseInt(row.impressions) || 0,
+      clicks: parseInt(row.clicks) || 0,
+      frequency: parseFloat(row.frequency) || 0,
+      ctr: (parseInt(row.impressions) || 0) > 0 ? ((parseInt(row.clicks) || 0) / (parseInt(row.impressions) || 0) * 100) : 0,
+    });
+  });
+  // Sort each ad's dailies by date
+  Object.values(adDailyMap).forEach(arr => arr.sort((a, b) => a.date.localeCompare(b.date)));
+
   // ── Rollup helper ─────────────────────────────────────────────────────
   function rollupData(rawData) {
     const rollup = {};
@@ -2913,12 +3078,16 @@ function syncMetaCreative(log) {
       .sort((a, b) => b.ageDays - a.ageDays);
 
     if (activeWithAge.length > 0) {
-      const lifeHeaders = ['Ad Name', 'Age (days)', 'Status', '7d ROAS', 'Trend', 'Lifespan Warning'];
+      const lifeHeaders = ['Thumbnail', 'Status', 'Ad Name', 'Age (days)', '7d ROAS', 'Trend'];
       sheet.getRange(r, 1, 1, lifeHeaders.length).setValues([lifeHeaders]);
-      sheet.getRange(r, 1, 1, lifeHeaders.length)
+      sheet.getRange(r, 7, 1, 4).merge().setValue('Lifespan Warning');
+      sheet.getRange(r, 1, 1, 10)
         .setFontWeight('bold').setBackground('#000000').setFontColor('#FFFFFF')
         .setHorizontalAlignment('center').setFontSize(9);
       r += 1;
+
+      // Ensure thumbnails have enough height
+      sheet.setRowHeights(r, activeWithAge.length, 70);
 
       activeWithAge.forEach((c, i) => {
         const pctOfLife = avgLife > 0 ? (c.ageDays / avgLife * 100) : 0;
@@ -2935,24 +3104,132 @@ function syncMetaCreative(log) {
           warnColor = '#137333';
         }
 
+        const thumbFormula = c.imgUrl ? `=IMAGE("${c.imgUrl}", 1)` : '';
+
+        // Merge cols 7-10 for lifespan warning width
         sheet.getRange(r, 1, 1, lifeHeaders.length).setValues([[
-          c.name, c.ageDays, c.status, c.recent.roas, c.roasTrend, warning
+          thumbFormula, c.status, c.name, c.ageDays, c.recent.roas, c.roasTrend
         ]]);
-        sheet.getRange(r, 4).setNumberFormat('0.00"x"');
-        sheet.getRange(r, 1, 1, lifeHeaders.length).setHorizontalAlignment('center').setVerticalAlignment('middle').setFontSize(9);
-        sheet.getRange(r, 1).setHorizontalAlignment('left');
-        sheet.getRange(r, 6).setHorizontalAlignment('left').setFontColor(warnColor).setFontWeight('bold');
+        sheet.getRange(r, 7, 1, 4).merge().setValue(warning);
+        sheet.getRange(r, 5).setNumberFormat('0.00"x"');
+        sheet.getRange(r, 1, 1, 10).setHorizontalAlignment('center').setVerticalAlignment('middle').setFontSize(9);
+        sheet.getRange(r, 3).setHorizontalAlignment('left'); // Ad name left aligned
+        sheet.getRange(r, 7).setHorizontalAlignment('left').setFontColor(warnColor).setFontWeight('bold').setWrap(true);
 
         if (pctOfLife >= 100) {
-          sheet.getRange(r, 1, 1, lifeHeaders.length).setBackground('#fde8e8');
+          sheet.getRange(r, 1, 1, 10).setBackground('#fde8e8');
         } else if (pctOfLife >= 80) {
-          sheet.getRange(r, 1, 1, lifeHeaders.length).setBackground('#fef7e0');
+          sheet.getRange(r, 1, 1, 10).setBackground('#fef7e0');
         } else if (i % 2 === 0) {
-          sheet.getRange(r, 1, 1, lifeHeaders.length).setBackground('#fafafa');
+          sheet.getRange(r, 1, 1, 10).setBackground('#fafafa');
         }
         r++;
       });
     }
+    r += 1;
+  }
+
+  // ── ⚡ AD FATIGUE EARLY WARNING ─────────────────────────────────────────
+  // Correlate rising frequency with declining CTR within the 7d window
+  const fatigueCreatives = allCreatives
+    .filter(c => c.phase === 'active' && c.recent.spend > 0 && c.recent.impressions > 100)
+    .map(c => {
+      // Find this ad's ad_id from the fullRollup keys
+      const adId = Object.keys(fullRollup).find(id => fullRollup[id].ad_name === c.name);
+      const dailies = adId ? adDailyMap[adId] : null;
+      if (!dailies || dailies.length < 4) return null;
+
+      // Split into early half and late half
+      const mid = Math.floor(dailies.length / 2);
+      const earlyDays = dailies.slice(0, mid);
+      const lateDays = dailies.slice(mid);
+
+      const earlyImpr = earlyDays.reduce((s, d) => s + d.impressions, 0);
+      const earlyClicks = earlyDays.reduce((s, d) => s + d.clicks, 0);
+      const earlyCtr = earlyImpr > 0 ? (earlyClicks / earlyImpr * 100) : 0;
+      const earlyFreq = earlyDays.reduce((s, d) => s + d.frequency, 0) / earlyDays.length;
+
+      const lateImpr = lateDays.reduce((s, d) => s + d.impressions, 0);
+      const lateClicks = lateDays.reduce((s, d) => s + d.clicks, 0);
+      const lateCtr = lateImpr > 0 ? (lateClicks / lateImpr * 100) : 0;
+      const lateFreq = lateDays.reduce((s, d) => s + d.frequency, 0) / lateDays.length;
+
+      const ctrDelta = earlyCtr > 0 ? ((lateCtr - earlyCtr) / earlyCtr * 100) : 0;
+      const freqDelta = earlyFreq > 0 ? ((lateFreq - earlyFreq) / earlyFreq * 100) : 0;
+      const avgFreq = (earlyFreq + lateFreq) / 2;
+
+      let signal = '✅ Healthy';
+      let signalColor = '#137333';
+      if (ctrDelta <= -15 && avgFreq >= 2.0) {
+        signal = '🔴 Fatiguing';
+        signalColor = '#C5221F';
+      } else if (ctrDelta <= -5 && avgFreq >= 1.5) {
+        signal = '🟡 Watch';
+        signalColor = '#E37400';
+      }
+
+      return {
+        ...c, earlyCtr, lateCtr, ctrDelta, avgFreq, signal, signalColor
+      };
+    })
+    .filter(c => c !== null)
+    .sort((a, b) => a.ctrDelta - b.ctrDelta); // worst CTR decay first
+
+  if (fatigueCreatives.length > 0) {
+    sheet.getRange(r, 1).setValue('⚡ AD FATIGUE EARLY WARNING').setFontWeight('bold').setFontSize(12);
+    r += 1;
+    sheet.getRange(r, 1, 1, 8).merge();
+    sheet.getRange(r, 1).setValue(
+      'Detects creatives where frequency is rising AND CTR is declining within the 7d window — the early signal of ad fatigue before ROAS drops.'
+    ).setFontSize(9).setFontStyle('italic').setFontColor('#333333').setWrap(true)
+      .setBackground('#fff8e1').setVerticalAlignment('middle');
+    sheet.setRowHeight(r, 30);
+    r += 1;
+
+    const fatigueHeaders = ['Thumbnail', 'Ad Name', 'Avg Freq', 'CTR (early)', 'CTR (late)', 'CTR Δ', 'Fatigue Signal'];
+    sheet.getRange(r, 1, 1, fatigueHeaders.length).setValues([fatigueHeaders]);
+    sheet.getRange(r, 1, 1, fatigueHeaders.length)
+      .setFontWeight('bold').setBackground('#1a1a2e').setFontColor('#FFFFFF')
+      .setHorizontalAlignment('center').setFontSize(9);
+    r += 1;
+
+    sheet.setRowHeights(r, fatigueCreatives.length, 70);
+
+    fatigueCreatives.forEach((c, i) => {
+      const thumbFormula = c.imgUrl ? `=IMAGE("${c.imgUrl}", 1)` : '';
+      const ctrDeltaStr = `${c.ctrDelta >= 0 ? '▲' : '▼'} ${Math.abs(c.ctrDelta).toFixed(1)}%`;
+
+      sheet.getRange(r, 1, 1, fatigueHeaders.length).setValues([[
+        thumbFormula, c.name, c.avgFreq, c.earlyCtr, c.lateCtr, ctrDeltaStr, c.signal
+      ]]);
+      sheet.getRange(r, 3).setNumberFormat('0.00');
+      sheet.getRange(r, 4).setNumberFormat('0.00"%"');
+      sheet.getRange(r, 5).setNumberFormat('0.00"%"');
+      sheet.getRange(r, 1, 1, fatigueHeaders.length).setHorizontalAlignment('center').setVerticalAlignment('middle').setFontSize(9);
+      sheet.getRange(r, 2).setHorizontalAlignment('left');
+
+      // Color the signal cell
+      sheet.getRange(r, 7).setFontWeight('bold').setFontColor(c.signalColor);
+
+      // Color CTR delta
+      if (c.ctrDelta <= -15) {
+        sheet.getRange(r, 6).setFontColor('#C5221F').setFontWeight('bold');
+      } else if (c.ctrDelta <= -5) {
+        sheet.getRange(r, 6).setFontColor('#E37400');
+      } else {
+        sheet.getRange(r, 6).setFontColor('#137333');
+      }
+
+      // Row background based on signal
+      if (c.signal.includes('🔴')) {
+        sheet.getRange(r, 1, 1, fatigueHeaders.length).setBackground('#fde8e8');
+      } else if (c.signal.includes('🟡')) {
+        sheet.getRange(r, 1, 1, fatigueHeaders.length).setBackground('#fef7e0');
+      } else if (i % 2 === 0) {
+        sheet.getRange(r, 1, 1, fatigueHeaders.length).setBackground('#fafafa');
+      }
+      r++;
+    });
     r += 1;
   }
 
